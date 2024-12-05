@@ -16,9 +16,9 @@ class CustomMean(Mean):
         else:
             return mean.expand(torch.broadcast_shapes(input.shape[:-1], mean.shape))
 
-class GPModel(gpytorch.models.ExactGP):
+class GPModel_vf(gpytorch.models.ExactGP):
     def __init__(self, d,p, train_x, train_y, likelihood, cfg, batch_shape=torch.Size([])):
-        super(GPModel, self).__init__(train_x, train_y, likelihood)
+        super(GPModel_vf, self).__init__(train_x, train_y, likelihood)
         # self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
         # self.mean_module = gpytorch.means.LinearMean(input_size=train_x.shape[-1], batch_shape=batch_shape)
         self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape)

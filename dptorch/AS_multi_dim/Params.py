@@ -3,7 +3,8 @@ import torch
 
 def set_params(cfg):
     """define parameters"""
-    cfg["model"]["params"]["n_types"] = 4
+    cfg["warm_start"] = False #warm start for gp fitting
+    cfg["model"]["params"]["n_types"] = 10
     cfg["model"]["params"]["beta"] = 0.9
     cfg["model"]["params"]["upper_trans"] = 1.
     cfg["model"]["params"]["lower_trans"] = 0.

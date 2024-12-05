@@ -10,6 +10,7 @@ from typing import List, Tuple
 import logging
 from math import ceil
 from scipy import optimize
+from GPModel import GPModel_vf,GPModel_pol
 
 from Utils import NonConvergedError
 import os
@@ -1090,416 +1091,64 @@ class SpecifiedModel(DPGPScipyModel):
         # gather estimated VF to all processes
         self.allgather()
 
-        n_feas_set_it = self.cfg["n_feas_set_it"]
-        if self.epoch <= n_feas_set_it: #self.cfg["BAL"]["epoch_freq"] - 1:  #remove most infeasible points and pick VF pts that are largest
+        #compute difference to previous iteration at sample points
+        self.metrics[str(self.epoch)] = {
+            "l2": self.convergence_error(fit_lst = fit_lst,ord=2),
+            "l_inf": self.convergence_error(fit_lst = fit_lst),
+        }
 
-            # self.feas_set_comp_per_state(training_iter, vf_lst)
-            self.feas_set_comp_per_state_with_BAL(training_iter, vf_lst)
+        logger.info(
+            f"Difference between previous interpolated values & next iterated values: {self.metrics[str(self.epoch)]['l_inf']} (L_inf) {self.metrics[str(self.epoch)]['l2']} (L2) for state policy pairs {fit_lst}"
+        )
 
-        else:
+        self.fit_GP(training_iter, fit_lst, self.warm_start) 
 
-            #compute difference to previous iteration at sample points
-            self.metrics[str(self.epoch)] = {
-                "l2": self.convergence_error(fit_lst = fit_lst,ord=2),
-                "l_inf": self.convergence_error(fit_lst = fit_lst),
-            }
-
-            logger.info(
-                f"Difference between previous interpolated values & next iterated values: {self.metrics[str(self.epoch)]['l_inf']} (L_inf) {self.metrics[str(self.epoch)]['l2']} (L2) for state policy pairs {fit_lst}"
-            )
-
-            self.fit_GP(training_iter, fit_lst, self.warm_start) 
-
-            self.warm_start = self.cfg.get("warm_start", False)
+        self.warm_start = self.cfg.get("warm_start", False)
 
 
+        metrics_how = {
+            "l2": self.convergence_error(fit_lst = vf_lst,ord=2),
+            "l_inf": self.convergence_error(fit_lst = vf_lst),
+        }
+        n_disc_states = self.cfg["model"]["params"]["n_types"]
+        indx_it = 0
+        error_old = 1
+        self.prev_combined_sample = self.combined_sample_all.clone()
+        while indx_it < self.cfg["model"]["params"]["n_Howard_steps"] and error_old > 1e-8 and self.epoch > max(100,self.cfg["BAL"]["epoch_freq"]):
+
+            # self.fit_GP(training_iter, vf_lst, self.warm_start)
+                
+            self.sample_all_Howard()
+            self.Howard_step(vf_lst)
+            self.allgather()
+            
             metrics_how = {
                 "l2": self.convergence_error(fit_lst = vf_lst,ord=2),
                 "l_inf": self.convergence_error(fit_lst = vf_lst),
             }
-            n_disc_states = self.cfg["model"]["params"]["n_types"]
-            indx_it = 0
-            error_old = 1
+            error_new = torch.sum(metrics_how['l2'])/n_disc_states
+            logger.info(
+                f"Howard iteration {indx_it} error: {error_new} (L2)"
+            )            
+            
+            if error_new > error_old:
+                self.combined_sample_all = self.prev_combined_sample.clone()
+                logger.info("No improvement in Howard it detected aborting iteration")
+                break
+
+            indx_it += 1
             self.prev_combined_sample = self.combined_sample_all.clone()
-            while indx_it < self.cfg["model"]["params"]["n_Howard_steps"] and error_old > 1e-8 and self.epoch > max(100,self.cfg["BAL"]["epoch_freq"]):
+            error_old = error_new
 
-                # self.fit_GP(training_iter, vf_lst, self.warm_start)
-                    
-                self.sample_all_Howard()
-                self.Howard_step(vf_lst)
-                self.allgather()
-                
-                metrics_how = {
-                    "l2": self.convergence_error(fit_lst = vf_lst,ord=2),
-                    "l_inf": self.convergence_error(fit_lst = vf_lst),
-                }
-                error_new = torch.sum(metrics_how['l2'])/n_disc_states
-                logger.info(
-                    f"Howard iteration {indx_it} error: {error_new} (L2)"
-                )            
-                
-                if error_new > error_old:
-                    self.combined_sample_all = self.prev_combined_sample.clone()
-                    logger.info("No improvement in Howard it detected aborting iteration")
-                    break
+            self.fit_GP(0, vf_lst, True) #sync GPs without training using previous parameters
 
-                indx_it += 1
-                self.prev_combined_sample = self.combined_sample_all.clone()
-                error_old = error_new
-
-                self.fit_GP(0, vf_lst, True) #sync GPs without training using previous parameters
-
-            if indx_it > 0:
-                self.fit_GP(training_iter, vf_lst, self.warm_start)  #fit GPs after Howard steps
+        if indx_it > 0:
+            self.fit_GP(training_iter, vf_lst, self.warm_start)  #fit GPs after Howard steps
 
 
         self.save()
 
 
-    def feas_set_comp_per_state(self,training_iter, fit_lst):
-        n_types = self.cfg["model"]["params"]["n_types"]
-        GP_offset_feas = self.cfg["model"]["params"]["GP_offset_feas"]
-        n_feas_set_it = self.cfg["n_feas_set_it"]
-        if self.epoch == n_feas_set_it:
-            no_feas_to_keep = self.cfg["no_feas_samples"] #number of points after feasible set iteration is done
-        else:
-            no_feas_to_keep = self.cfg["no_samples"] #number of points during feasible set iteration
-
-        # mask of all feasible points
-
-        no_infeas_to_keep = (n_types + 1)
-        threashold = -0.05 - GP_offset_feas
-
-        mask_feas_old = self.V_sample_all >= threashold
-        mask_infeas_old = torch.logical_not(mask_feas_old)            
-        n_feas_pts = torch.sum(mask_feas_old)
-        n_infeas_pts = torch.sum(mask_infeas_old)
-
-        logger.info(f"In init sample we overall had {n_feas_pts} feasible points and {n_infeas_pts} infeasible points.")
-
-        if self.epoch <= n_feas_set_it:  # first iteration initialize infeasible points
-            
-            self.fit_GP(training_iter, fit_lst, self.warm_start) 
-
-            if self.epoch == 1:
-                self.infeasible_pts = torch.zeros([0,self.state_sample_all.shape[1]])
-                self.V_infeasible_pts = torch.zeros([0])
-
-            # for each type add a certain number of infeasible points
-            for indxtype in range(n_types):
-                mask_type = self.state_sample_all[mask_infeas_old,-1] == 1.*indxtype
-                inf_sample_pts_all = self.state_sample_all[mask_infeas_old,:][mask_type,:]
-                with torch.no_grad():
-                    V_val_vec = self.M[indxtype][0](inf_sample_pts_all[:,:-1]).mean
-
-                self.infeasible_pts = torch.cat(
-                    (
-                        self.infeasible_pts,
-                        inf_sample_pts_all[-no_infeas_to_keep:,:]
-                    ),
-                    dim=0
-                )
-                self.V_infeasible_pts = torch.cat(
-                    (
-                        self.V_infeasible_pts,
-                        V_val_vec[-no_infeas_to_keep:]
-                    ),
-                    dim=0
-                )
-
-            # reset all values
-            self.state_sample_all = self.infeasible_pts # initialize with penalty points
-            self.combined_sample_all = torch.zeros([self.infeasible_pts.shape[0],self.combined_sample_all.shape[1]])
-            self.combined_sample_all[:,0] = self.V_infeasible_pts
-            self.non_converged_all = torch.zeros(self.infeasible_pts.shape[0])
-            self.V_sample_all = self.V_infeasible_pts
-            self.feasible_all = torch.zeros(self.infeasible_pts.shape[0])
-
-            n_sample_pts_mult = 64  # factor to oversample by to have sufficient feasible points
-            rand_sample, dummy = self.sample(n_sample_pts_mult * self.cfg["no_samples"])
-            for indxtype in range(n_types):
-                mask_type = rand_sample[:,-1] == 1.*indxtype
-                with torch.no_grad():
-                    V_val_vec = self.M[indxtype][0](rand_sample[mask_type,:-1]).mean
-
-                mask_feas = V_val_vec >= threashold
-                n_feas_pts = torch.sum(mask_feas)
-                mask_infeas = torch.logical_not(mask_feas)            
-                n_infeas_pts = torch.sum(mask_infeas)
-                new_rand_feas_pts = rand_sample[mask_type,:][mask_feas,:][:no_feas_to_keep,:]
-                max_vec = torch.max(new_rand_feas_pts,dim=0)
-                min_vec = torch.min(new_rand_feas_pts,dim=0)
-                norm_vec = torch.linalg.norm(new_rand_feas_pts[:,:-1],dim=1,ord=1) / n_types
-                logger.info(f"In state {indxtype} redrawn sample had {n_feas_pts} feasible points and {n_infeas_pts} infeasible points with min {min_vec[0]} {torch.min(norm_vec)} and max {max_vec[0]} {torch.max(norm_vec)}.")
-                lower_w = scale_state_func(self.cfg["model"]["params"]["lower_w"],self.cfg)
-                upper_w = scale_state_func(self.cfg["model"]["params"]["upper_w"],self.cfg)                
-                self.state_sample_all = torch.cat(
-                    (
-                        self.state_sample_all,
-                        new_rand_feas_pts
-                    ),0)
-                combined_sample_all = torch.zeros([new_rand_feas_pts.shape[0],self.combined_sample_all.shape[1]])
-                self.combined_sample_all = torch.cat(
-                    (
-                        self.combined_sample_all,
-                        combined_sample_all
-                    ),0)
-                self.non_converged_all = torch.cat(
-                    (
-                        self.non_converged_all,
-                        torch.zeros(new_rand_feas_pts.shape[0])
-                    ),0)
-                self.V_sample_all = torch.cat(
-                    (
-                        self.V_sample_all,
-                        torch.zeros([new_rand_feas_pts.shape[0]])
-                    ),0)
-                self.feasible_all = torch.cat(
-                    (
-                        self.feasible_all,
-                        torch.ones(new_rand_feas_pts.shape[0])
-                    ),0)
-
-            # if self.epoch > 1:
-            # self.trim_samples()
-            
-            # reset vf vals to init guess for stability
-            if self.epoch == n_feas_set_it:
-                V_sample_all = torch.zeros(self.state_sample_all.shape[0])
-                for i in range(self.state_sample_all.shape[0]):
-                    V_sample_all[i] =  V_INFINITY(self, self.state_sample_all[i,:]) * self.feasible_all[i]
-
-                self.combined_sample_all[:,0] = V_sample_all
-                self.V_sample_all = V_sample_all
-                self.V_sample = V_sample_all
-
-        else:
-
-            self.fit_GP(training_iter, fit_lst, self.warm_start) 
-
-        self.warm_start = False
-
-    def feas_set_comp_per_state_with_BAL(self,training_iter, fit_lst):
-        n_types = self.cfg["model"]["params"]["n_types"]
-        GP_offset_feas = self.cfg["model"]["params"]["GP_offset_feas"]
-        n_feas_set_it = self.cfg["n_feas_set_it"]
-        # if self.epoch == n_feas_set_it:
-        #     no_feas_to_keep = self.cfg["no_feas_samples"] #number of points after feasible set iteration is done
-        # else:
-        #     no_feas_to_keep = self.cfg["no_samples"] #number of points during feasible set iteration
-
-        # mask of all feasible points
-
-        no_infeas_to_keep = (n_types + 1)
-        threashold = -0.5 - GP_offset_feas
-
-        mask_feas_old = self.V_sample_all >= threashold
-        mask_infeas_old = torch.logical_not(mask_feas_old)            
-        n_feas_pts = torch.sum(mask_feas_old)
-        n_infeas_pts = torch.sum(mask_infeas_old)
-
-        logger.info(f"In init sample we overall had {n_feas_pts} feasible points and {n_infeas_pts} infeasible points.")
-
-        if self.epoch <= n_feas_set_it:  # first iteration initialize infeasible points
-            
-            self.fit_GP(training_iter, fit_lst, self.warm_start) 
-
-            if self.epoch == 1 and self.epoch < n_feas_set_it:
-                # reset all values
-                state_sample_all = torch.zeros([0,self.state_sample_all.shape[1]])
-                combined_sample_all = torch.zeros([0,self.combined_sample_all.shape[1]])
-                non_converged_all = torch.zeros([0])
-                V_sample_all = torch.zeros([0])
-                feasible_all = torch.zeros([0])
-
-                # for each type add a certain number of infeasible points
-                for indxtype in range(n_types):
-                    mask_type_inf = self.state_sample_all[mask_infeas_old,-1] == 1.*indxtype
-                    mask_type_feas = self.state_sample_all[mask_feas_old,-1] == 1.*indxtype
-
-                    state_sample_all = torch.cat(
-                        (
-                            state_sample_all,
-                            self.state_sample_all[mask_feas_old,:][mask_type_feas,:],
-                            self.state_sample_all[mask_infeas_old,:][mask_type_inf,:][-no_infeas_to_keep:,:]
-                        ),
-                        dim=0
-                    )
-                    combined_sample_all = torch.cat(
-                        (
-                            combined_sample_all,
-                            self.combined_sample_all[mask_feas_old,:][mask_type_feas,:],
-                            self.combined_sample_all[mask_infeas_old,:][mask_type_inf,:][-no_infeas_to_keep:,:]
-                        ),
-                        dim=0
-                    )
-                    V_sample_all = torch.cat(
-                        (
-                            V_sample_all,
-                            self.V_sample_all[mask_feas_old][mask_type_feas],
-                            self.V_sample_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-                    non_converged_all = torch.cat(
-                        (
-                            non_converged_all,
-                            self.non_converged_all[mask_feas_old][mask_type_feas],
-                            self.non_converged_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-                    feasible_all = torch.cat(
-                        (
-                            feasible_all,
-                            self.feasible_all[mask_feas_old][mask_type_feas],
-                            self.feasible_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-
-                self.state_sample_all = state_sample_all
-                self.combined_sample_all = combined_sample_all
-                self.non_converged_all = non_converged_all
-                self.V_sample_all = V_sample_all
-                self.feasible_all = feasible_all
-
-            else:
-                max_n_samples_for_BAL = 1000
-                n_sample_pts_mult = 64  # factor to oversample by to have sufficient feasible points
-                rand_sample, dummy = self.sample(n_sample_pts_mult * self.cfg["no_samples"])
-                for indxtype in range(n_types):
-                    mask_type = rand_sample[:,-1] == 1.*indxtype
-                    with torch.no_grad():
-                        V_val_vec = self.M[indxtype][0](rand_sample[mask_type,:-1]).mean
-
-                    mask_feas = V_val_vec >= threashold
-                    n_feas_pts = torch.sum(mask_feas)
-                    n_to_test = min(n_feas_pts,max_n_samples_for_BAL)
-                    max_bal_indx = 0
-                    max_bal_util = self.mean_squared_error_GP(rand_sample[mask_type,:-1][0:1,:], indxtype, 0)
-                    for indx in range(1,n_to_test):
-                        bal_util = self.mean_squared_error_GP(rand_sample[mask_type,:-1][indx:(indx+1),:], indxtype, 0)
-                        if bal_util > max_bal_util:
-                            max_bal_indx = indx
-                            max_bal_util = bal_util
-
-                    mask_infeas = torch.logical_not(mask_feas)            
-                    n_infeas_pts = torch.sum(mask_infeas)
-                    new_rand_feas_pts = rand_sample[mask_type,:][mask_feas,:]#[:no_feas_to_keep,:]
-                    max_vec = torch.max(new_rand_feas_pts,dim=0)
-                    min_vec = torch.min(new_rand_feas_pts,dim=0)
-                    norm_vec = torch.linalg.norm(new_rand_feas_pts[:,:-1],dim=1,ord=1) / n_types
-                    logger.info(f"In state {indxtype} redrawn sample had {n_feas_pts} feasible points and {n_infeas_pts} infeasible points with min {min_vec[0]} {torch.min(norm_vec)} and max {max_vec[0]} {torch.max(norm_vec)}.")
-                    self.state_sample_all = torch.cat(
-                        (
-                            self.state_sample_all,
-                            torch.unsqueeze(rand_sample[mask_type,:][max_bal_indx,:],0)
-                        ),0)
-                    combined_sample_all = torch.zeros([1,self.combined_sample_all.shape[1]])
-                    self.combined_sample_all = torch.cat(
-                        (
-                            self.combined_sample_all,
-                            combined_sample_all
-                        ),0)
-                    self.non_converged_all = torch.cat(
-                        (
-                            self.non_converged_all,
-                            torch.zeros(1)
-                        ),0)
-                    self.V_sample_all = torch.cat(
-                        (
-                            self.V_sample_all,
-                            torch.zeros([1])
-                        ),0)
-                    self.feasible_all = torch.cat(
-                        (
-                            self.feasible_all,
-                            torch.ones(1)
-                        ),0)
-
-            
-            # reset vf vals to init guess for stability
-            if self.epoch == n_feas_set_it:
-
-                mask_feas_old = self.V_sample_all >= threashold
-                mask_infeas_old = torch.logical_not(mask_feas_old)                     
-
-                # reset all values
-                no_infeas_to_keep = 2*(n_types + 1)
-                state_sample_all = torch.zeros([0,self.state_sample_all.shape[1]])
-                combined_sample_all = torch.zeros([0,self.combined_sample_all.shape[1]])
-                non_converged_all = torch.zeros([0])
-                V_sample_all = torch.zeros([0])
-                feasible_all = torch.zeros([0])
-
-                # for each type add a certain number of infeasible points
-                for indxtype in range(n_types):
-                    mask_type_inf = self.state_sample_all[mask_infeas_old,-1] == 1.*indxtype
-                    mask_type_feas = self.state_sample_all[mask_feas_old,-1] == 1.*indxtype
-
-                    state_sample_all = torch.cat(
-                        (
-                            state_sample_all,
-                            self.state_sample_all[mask_feas_old,:][mask_type_feas,:],
-                            self.state_sample_all[mask_infeas_old,:][mask_type_inf,:][-no_infeas_to_keep:,:]
-                        ),
-                        dim=0
-                    )
-                    combined_sample_all = torch.cat(
-                        (
-                            combined_sample_all,
-                            self.combined_sample_all[mask_feas_old,:][mask_type_feas,:],
-                            self.combined_sample_all[mask_infeas_old,:][mask_type_inf,:][-no_infeas_to_keep:,:]
-                        ),
-                        dim=0
-                    )
-                    V_sample_all = torch.cat(
-                        (
-                            V_sample_all,
-                            self.V_sample_all[mask_feas_old][mask_type_feas],
-                            self.V_sample_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-                    non_converged_all = torch.cat(
-                        (
-                            non_converged_all,
-                            self.non_converged_all[mask_feas_old][mask_type_feas],
-                            self.non_converged_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-                    feasible_all = torch.cat(
-                        (
-                            feasible_all,
-                            self.feasible_all[mask_feas_old][mask_type_feas],
-                            self.feasible_all[mask_infeas_old][mask_type_inf][-no_infeas_to_keep:]
-                        ),
-                        dim=0
-                    )
-
-                self.state_sample_all = state_sample_all
-                self.combined_sample_all = combined_sample_all
-                self.non_converged_all = non_converged_all
-                self.V_sample_all = V_sample_all
-                self.feasible_all = feasible_all
-
-
-                V_sample_all = torch.zeros(self.state_sample_all.shape[0])
-                for i in range(self.state_sample_all.shape[0]):
-                    V_sample_all[i] =  V_INFINITY(self, self.state_sample_all[i,:])
-
-                self.combined_sample_all[:,0] = V_sample_all
-                self.V_sample_all = V_sample_all
-                self.V_sample = V_sample_all
-                self.feasible_all[:] = 1.0
-
-        else:
-
-            self.fit_GP(training_iter, fit_lst, self.warm_start) 
-
-        self.warm_start = False
 
     @torch.no_grad()
     def Howard_step(self,vf_lst):
@@ -1560,94 +1209,46 @@ class SpecifiedModel(DPGPScipyModel):
 
 
     def create_model(self, d, p, train_x, train_y, warm_start=False):
-        if self.cfg.get('use_fixed_noise',True):
-            if p == 0:
-                noise_vec = torch.zeros(train_y.shape[0])
-                noise_vec[:] = self.cfg["gpytorch"].get("likelihood_noise_feas_vf", 1e-4)
-                # lower_V = self.cfg["model"]["params"]["lower_V"]
-                # gp_offset = self.cfg["model"]["params"]["GP_offset"][d]                
-                # feas_mask = train_y[:] + gp_offset >= lower_V
-                # noise_vec[feas_mask] = self.cfg["gpytorch"].get("likelihood_noise_feas_vf", 1e-4)
-                # infeas_mask = train_y[:] + gp_offset < lower_V - 0.1
-                # noise_vec[infeas_mask] = self.cfg["gpytorch"].get("likelihood_noise_infeas_vf", 1e-2)
-            else:
-                noise_vec = torch.ones(train_y.shape[0])*self.cfg["gpytorch"].get("likelihood_noise_pol", 1e-3)
+        if p == 0:
+            noise_vec = torch.zeros(train_y.shape[0])
+            noise_vec[:] = torch.ones(train_y.shape[0]) * 1e-5 
+        else:
+            noise_vec = torch.ones(train_y.shape[0]) * 1e-5
 
-            self.likelihood[d][p] = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-                        noise_vec,
-                        learn_additional_noise=False
+        self.likelihood[d][p] = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+                    noise_vec,
+                    learn_additional_noise=False
+                ).to(self.device)
+
+        # self.likelihood[d][p] = gpytorch.likelihoods.GaussianLikelihood(
+        #             noise_constraint=gpytorch.constraints.GreaterThan(1e-6)
+        #         ).to(self.device)
+
+
+
+        if p > 0:
+            model = GPModel_pol(
+                        d,
+                        p,
+                        train_x,
+                        train_y,
+                        self.likelihood[d][p],
+                        self.cfg
+                    ).to(self.device)
+        else:
+            model = self.Model(
+                        d,
+                        p,
+                        train_x,
+                        train_y,
+                        self.likelihood[d][p],
+                        self.cfg
                     ).to(self.device)
 
-        else:
-            self.likelihood[d][p] = gpytorch.likelihoods.GaussianLikelihood(
-                        noise_constraint=gpytorch.constraints.GreaterThan(1e-7)
-                    ).to(self.device)
 
-
-
-        if not self.cfg["model"]["GP_MODEL"]["name"] == "VariationalGPModel":
-            from GPModels.ExactGPModel import GPModel_feas,GPModel_pol
-            if p > 0 or self.epoch > self.cfg["n_feas_set_it"]:
-                if p > 0:
-                    model = GPModel_pol(
-                                d,
-                                p,
-                                train_x,
-                                train_y,
-                                self.likelihood[d][p],
-                                self.cfg
-                            ).to(self.device)
-                else:
-                    model = self.Model(
-                                d,
-                                p,
-                                train_x,
-                                train_y,
-                                self.likelihood[d][p],
-                                self.cfg
-                            ).to(self.device)
-
-            else:
-                model = GPModel_feas(
-                            d,
-                            p,
-                            train_x,
-                            train_y,
-                            self.likelihood[d][p],
-                            self.cfg
-                        ).to(self.device)
-
-        else:
-            from GPModels.VariationalGPModel import EGPModel
-            if p > 0:
-                model = EGPModel(
-                            d,
-                            p,
-                            train_x,
-                            train_y,
-                            self.likelihood[d][p],
-                            self.cfg,
-                        ).to(self.device)
-            else:
-                model = self.Model(
-                            d,
-                            p,
-                            train_x,
-                            train_y,
-                            self.likelihood[d][p],
-                            self.cfg,
-                        ).to(self.device)
-
-
-
-        if self.cfg["model"]["GP_MODEL"]["name"] == "VariationalGPModel":
-            self.mll[d][p] = gpytorch.mlls.VariationalELBO(
-                        self.likelihood[d][p], model, num_data=train_y.shape[0]
-                    )
-        else:
-            self.mll[d][p] = gpytorch.mlls.ExactMarginalLogLikelihood(
-                        self.likelihood[d][p], model
-                    )
+        self.mll[d][p] = gpytorch.mlls.ExactMarginalLogLikelihood(
+                    self.likelihood[d][p], model
+                )
 
         if warm_start:
             state_dict = copy.deepcopy(self.M[d][p].state_dict())
