@@ -63,16 +63,16 @@ def set_conf(cfg):
     torch.manual_seed(cfg["mc_seed"])
 
     model = importlib.import_module(cfg["MODEL_NAME"] + ".Model")
+    importlib.import_module(cfg["MODEL_NAME"] + ".Params")
 
     try:
         # dynamic parameters
-        cfg = importlib.import_module(
-            cfg["model"]["MODEL_NAME"] + ".Params"
-        ).set_params(cfg)
+        cfg = importlib.import_module(cfg["MODEL_NAME"] + ".Params")
     except FileNotFoundError:
-        logger.warning(
-            "No Params.py found - continuing with using only parameters from yaml file."
+        logger.error(
+            "No Params.py found."
         )
+        return None
     except AttributeError:
         logger.warning(
             "No method named `dynamic_params` found in Params.py - continuing using only parameters from yaml file."

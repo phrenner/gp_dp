@@ -2,8 +2,19 @@ import importlib
 import torch
 
 def set_params(cfg):
-    """define parameters"""
+
     cfg["warm_start"] = False #warm start for gp fitting
+    cfg["torch_optim"]["relative_ll_change_tol_vf"] = 0
+    cfg["torch_optim"]["relative_ll_grad_change_tol_vf"] = 0
+    cfg["torch_optim"]["relative_error_tol_vf"] = 0
+    cfg["torch_optim"]["parameter_change_tol_vf"] = 1e-3
+
+    cfg["torch_optim"]["relative_ll_change_tol_pol"] = 0
+    cfg["torch_optim"]["relative_ll_grad_change_tol_pol"] = 0
+    cfg["torch_optim"]["relative_error_tol_pol"] = 0
+    cfg["torch_optim"]["parameter_change_tol_pol"] = 1e-3
+
+    ### Define constants
     cfg["model"]["params"]["n_types"] = 10
     cfg["model"]["params"]["beta"] = 0.9
     cfg["model"]["params"]["upper_trans"] = 1.
@@ -16,6 +27,7 @@ def set_params(cfg):
     cfg["model"]["params"]["pen_vf"] = 10.0
     cfg["model"]["params"]["n_Howard_steps"] = 0    
 
+    ### Compute derived parameters
     model = importlib.import_module(
             cfg["model"]["MODEL_NAME"] + ".Model"
         )
@@ -34,21 +46,14 @@ def set_params(cfg):
     tmp_mat[0,0] = 0.9
     tmp_mat[-1,-1] = 0.9
     trans_mat = trans_mat + tmp_mat #set diagonal to 0.8 except for the corner pts
-    L,V = torch.linalg.eig(trans_mat)
-    reg_c = cfg["model"]["params"]["reg_c"]
-    sigma = cfg["model"]["params"]["sigma"]
-    long_run = torch.unsqueeze(1/(1 - beta * L.real),-1)
-    right_side = torch.matmul(torch.linalg.inv(V.real),torch.unsqueeze(model.utility_ind(shoch_vec, reg_c, sigma),-1))
-    reseveration_util_vec = torch.ones(n_types)
-    for indxt in range(n_types):
-        reseveration_util_vec[indxt] = torch.matmul((V.real)[indxt:indxt+1,:],right_side*long_run)[0]
-    cfg["model"]["params"]["reseveration_util_vec"] = (reseveration_util_vec)
     cfg["model"]["params"]["trans_mat"] = trans_mat
     cfg["model"]["params"]["trans_mat_inv"] = torch.inverse(cfg["model"]["params"]["trans_mat"])
     upper_trans = cfg["model"]["params"]["upper_trans"]
     lower_trans = cfg["model"]["params"]["lower_trans"]
     cfg["model"]["params"]["discrete_state_dim"] = n_types
 
+    reg_c = cfg["model"]["params"]["reg_c"]
+    sigma = cfg["model"]["params"]["sigma"]
     upper_w = model.utility_ind(upper_trans, reg_c, sigma)/(1-beta)
     cfg["model"]["params"]["upper_w"] = upper_w * torch.ones(n_types)
 
@@ -76,3 +81,4 @@ def set_params(cfg):
         ] * cfg["model"]["params"]["n_types"]
 
     return cfg
+

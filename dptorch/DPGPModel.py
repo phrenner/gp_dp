@@ -1,8 +1,6 @@
 import torch
 import gpytorch
 import logging
-from GPModels.ExactGPModel import GPModel
-from ExpectOps.SinglePoint import ExpectOps
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 import copy
