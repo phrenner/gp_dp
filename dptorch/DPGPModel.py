@@ -859,7 +859,7 @@ class DPGPModel(ABC):
                 scale = (
                     1.0
                     if ord == float("inf")
-                    else 1 / (self.state_sample_all[mask,:].shape[0])
+                    else 1 / max(1,self.state_sample_all[mask,:].shape[0])
                 )
                 err[indxd] = scale * err[indxd]
         return err
@@ -1073,24 +1073,29 @@ class DPGPModel(ABC):
                 if int(A / points_per_worker) == dist.get_rank()
             ]
             # subset state to given rank
-            self.state_sample = self.state_sample_all[
-                min(self.worker_slice) : (max(self.worker_slice) + 1), :
-            ]
-            self.combined_sample = self.combined_sample_all[
-                min(self.worker_slice) : (max(self.worker_slice) + 1), :
-            ]
-            self.feasible = self.feasible_all[
-                min(self.worker_slice) : (max(self.worker_slice) + 1)
-            ]
-            self.non_converged = self.non_converged_all[
-                min(self.worker_slice) : (max(self.worker_slice) + 1)
-            ]
+            try:
+                self.state_sample = self.state_sample_all[
+                    min(self.worker_slice) : (max(self.worker_slice) + 1), :
+                ]
+                self.combined_sample = self.combined_sample_all[
+                    min(self.worker_slice) : (max(self.worker_slice) + 1), :
+                ]
+                self.feasible = self.feasible_all[
+                    min(self.worker_slice) : (max(self.worker_slice) + 1)
+                ]
+                self.non_converged = self.non_converged_all[
+                    min(self.worker_slice) : (max(self.worker_slice) + 1)
+                ]
+            except:
+                self.state_sample = torch.empty([0, self.state_sample_all.shape[1]])
+                self.combined_sample = torch.empty([0, self.combined_sample_all.shape[1]])
+                self.feasible = torch.empty([0])
+                self.non_converged = torch.empty([0])
         else:
             self.non_converged = self.non_converged_all
             self.feasible = self.feasible_all
             self.combined_sample = self.combined_sample_all
             self.state_sample = self.state_sample_all
-
     def sample_all(self, init_sample=None):
         if init_sample is None:
             if self.epoch == 0:
