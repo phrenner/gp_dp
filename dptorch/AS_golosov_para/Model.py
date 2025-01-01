@@ -918,19 +918,6 @@ class SpecifiedModel(DPGPScipyModel):
                     out[indxp,:] = cand_pts[indxd,:-1]
                     indxp+=1
 
-            beta = self.cfg["model"]["params"]["beta"]
-
-            # out = torch.cat(
-            #     (
-            #         torch.tensor(
-            #         [
-            #             [(1-beta) * 2 * 8.5,(1-beta) * 2 * 9.5,0.],                        
-            #             # [(1-beta) * 2 * 9.,(1-beta) * 2 * 9.5,0.],
-            #                 ]), #adding in corner points of feasible set for plotting
-            #         out
-            #     ),dim=0
-            # )            
-            # logger.info(f"BAL added points {out} after iteration {indxt}")
             new_sample = out
             self.state_sample = torch.cat(
                 (
@@ -1119,15 +1106,9 @@ class SpecifiedModel(DPGPScipyModel):
     def create_model(self, d, p, train_x, train_y, warm_start=False):
         if self.cfg.get('use_fixed_noise',True):
             if p == 0:
-                lower_V = self.cfg["model"]["params"]["lower_V"]
-                gp_offset = self.cfg["model"]["params"]["GP_offset"]                
-                noise_vec = torch.zeros(train_y.shape[0])
-                feas_mask = train_y[:] + gp_offset >= lower_V
-                noise_vec[feas_mask] = self.cfg["gpytorch"].get("likelihood_noise_feas_vf", 1e-4)
-                infeas_mask = train_y[:] + gp_offset < lower_V - 0.1
-                noise_vec[infeas_mask] = self.cfg["gpytorch"].get("likelihood_noise_infeas_vf", 1e-2)
+                noise_vec = torch.ones(train_y.shape[0]) * 1e-5
             else:
-                noise_vec = torch.ones(train_y.shape[0])*self.cfg["gpytorch"].get("likelihood_noise_pol", 1e-3)
+                noise_vec = torch.ones(train_y.shape[0]) * 1e-5
 
             self.likelihood[d][p] = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
                         noise_vec,
@@ -1139,19 +1120,9 @@ class SpecifiedModel(DPGPScipyModel):
                         noise_constraint=gpytorch.constraints.GreaterThan(1e-7)
                     ).to(self.device)
 
-        if p > 0:
-            from GPModels.ExactGPModel import GPModel_pol
-            model = GPModel_pol(
-                        d,
-                        p,
-                        train_x,
-                        train_y,
-                        self.likelihood[d][p],
-                        self.cfg,
-                    ).to(self.device)
-
-        else:
-            model = self.Model(
+        import importlib
+        gp_model = importlib.import_module(self.cfg["MODEL_NAME"] + ".GPModel")
+        model = gp_model.GPModel(
                         d,
                         p,
                         train_x,

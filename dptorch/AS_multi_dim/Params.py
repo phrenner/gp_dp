@@ -4,6 +4,9 @@ import torch
 def set_params(cfg):
 
     cfg["warm_start"] = False #warm start for gp fitting
+    cfg["use_fixed_noise"] = True #use fixed noise for likelyhood
+    cfg["drop_non_converged"] = True #drop non converged points from the training set
+
     cfg["torch_optim"]["relative_ll_change_tol_vf"] = 0
     cfg["torch_optim"]["relative_ll_grad_change_tol_vf"] = 0
     cfg["torch_optim"]["relative_error_tol_vf"] = 0

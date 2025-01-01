@@ -1,6 +1,6 @@
 hydra: 
   run:
-    dir: runs/${model.MODEL_NAME}/cluster  #2022-03-22/13-15-31 #${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: runs/${MODEL_NAME}/test  #2022-03-22/13-15-31 #${now:%Y-%m-%d}/${now:%H-%M-%S}
   verbose: false
 # can be NEW, LATEST, or a given checkpoint filename
 MODEL_NAME: AS_golosov_para #AS_constrained_split #cont_vanilla

@@ -10,7 +10,6 @@ from typing import List, Tuple
 import logging
 from math import ceil
 from scipy import optimize
-from GPModel import GPModel_vf,GPModel_pol
 
 from Utils import NonConvergedError
 import os
@@ -34,28 +33,49 @@ else:
 #     Philipp Renner, 09/21
 # ======================================================================
 
-from scipy.spatial import distance_matrix
+from numpy.linalg import det
+from scipy.stats import dirichlet
+from scipy.spatial import ConvexHull, Delaunay
 
-def max_distance_subset(points, S):
-    # Step 1: Compute the pairwise distance matrix
-    dist_matrix = distance_matrix(points, points)
-    
-    # Step 2: Initialize the subset with the first point
-    subset_indices = [0]
-    
-    # Step 3: Greedily select the next point to maximize the minimum distance to the existing subset
-    for _ in range(1, S):
-        # Compute the minimum distance of each point to the current subset
-        min_distances = np.min(dist_matrix[subset_indices], axis=0)
+
+def sample_on_convex_hull(points, n):
+    dims = points.shape[-1]
+    hull = points[ConvexHull(points).vertices]
+    deln = hull[Delaunay(hull).simplices]
+
+    vols = np.abs(det(deln[:, :dims, :] - deln[:, dims:, :])) / np.math.factorial(dims)    
+    sample = np.random.choice(len(vols), size = n, p = vols / vols.sum())
+
+    return np.einsum('ijk, ij -> ik', deln[sample], dirichlet.rvs([1]*(dims + 1), size = n))
+
+
+def sample_from_nd_ball(n, r, num_samples=1):
+    """
+    Draws uniform samples from an n-dimensional ball of radius r.
+
+    Parameters:
+        n (int): Dimension of the ball.
+        r (float): Radius of the ball.
+        num_samples (int): Number of samples to generate.
+
+    Returns:
+        numpy.ndarray: An array of shape (num_samples, n) containing the samples.
+    """
+    samples = []
+    for _ in range(num_samples):
+        # Step 1: Generate a random point from a standard normal distribution
+        point = np.random.normal(0, 1, n)
         
-        # Find the index of the point that has the maximum of these minimum distances
-        next_index = np.argmax(min_distances)
+        # Step 2: Normalize the point to lie on the unit sphere
+        point /= np.linalg.norm(point)
         
-        # Add this point to the subset
-        subset_indices.append(next_index)
+        # Step 3: Scale the radius by a random factor
+        radius_scale = np.random.uniform(0, 1) ** (1 / n)
+        scaled_point = radius_scale * r * point
+        
+        samples.append(scaled_point)
     
-    # Return the subset of points
-    return points[subset_indices]
+    return np.array(samples)
 
 # ======================================================================
 
@@ -67,6 +87,7 @@ def inv_utility_ind(util, reg_c, sigma): #inverse utility function
 
 n_rand_its = 1
 
+reg_val = 0.000001
 def scale_state_func(unscaled_state,cfg):
     beta = cfg["model"]["params"]["beta"]
     n_types = cfg["model"]["params"]["n_types"]
@@ -76,6 +97,7 @@ def scale_state_func(unscaled_state,cfg):
     lower_w = cfg["model"]["params"]["lower_w"]
     state_scaled = unscaled_state.clone()
     # state_scaled[...,:n_types] = inv_utility_ind(unscaled_state[...,:n_types] * (1-beta),reg_c,sigma) 
+    # state_scaled[...,:] = torch.log(unscaled_state[...,:] * (1-beta) + reg_val)
     state_scaled[...,:] = unscaled_state[...,:] * (1-beta)
     return state_scaled
 
@@ -88,6 +110,7 @@ def unscale_state_func(state_scaled,cfg):
     lower_w = cfg["model"]["params"]["lower_w"]
     unscaled_state = state_scaled.clone()
     # unscaled_state[...,:n_types] = utility_ind(state_scaled[...,:n_types],reg_c,sigma) / (1-beta)
+    # unscaled_state[...,:] = (torch.exp(state_scaled[...,:]) - reg_val) / (1-beta)
     unscaled_state[...,:] = state_scaled[...,:] / (1-beta)
     return unscaled_state
 
@@ -106,7 +129,6 @@ def V_INFINITY(model, scaled_state):
     lower_w = (model.cfg["model"]["params"]["lower_w"])
     upper_w = (model.cfg["model"]["params"]["upper_w"])
     lower_V = model.cfg["model"]["params"]["lower_V"]
-    n_feas_set_it = model.cfg["n_feas_set_it"]
     disc_state = state[-1].type(torch.IntTensor)
 
     # max_val = (0.5 * (upper_w[disc_state] - lower_w[disc_state]))**2
@@ -126,15 +148,13 @@ def V_INFINITY(model, scaled_state):
         sum_tmp += trans_mat[disc_state,indxa]*(
             shock_vals[indxa] - inv_utility_ind((1 - beta) * state[model.S[f"w_{indxa+1}"]],reg_c,sigma))
 
-    if model.epoch < n_feas_set_it:
-        mult_fac = 0.0
-        gp_offset = model.cfg["model"]["params"]["GP_offset_feas"]
-    else:
-        gp_offset = model.cfg["model"]["params"]["GP_offset"]
-        mult_fac = 1.0
 
-    v_infinity = -gp_offset + mult_fac * sum_tmp
-
+    gp_offset = model.cfg["model"]["params"]["GP_offset"]
+    mult = 1.
+    if model.epoch == 0:
+        mult = 0.
+    
+    v_infinity = -gp_offset + sum_tmp * mult
     return v_infinity
 
 
@@ -198,23 +218,23 @@ def EV_G_ITER(model, scaled_state, params, control):
     G_[:n_types] = out_tmp
     counter = n_types
 
-    # G_[counter : counter + n_types] = state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[P[f"pen_{1}"] : P[f"pen_{1}"] + n_types] - control[P[f"pen_u_{1}"] : P[f"pen_u_{1}"] + n_types] - \
-    #     torch.sum(torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(control[future_util_diag_mask]),0)*trans_mat[:,:],-1)
-
     G_[counter : counter + n_types] = state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[P[f"pen_{1}"] : P[f"pen_{1}"] + n_types] - control[P[f"pen_u_{1}"] : P[f"pen_u_{1}"] + n_types] - \
-        torch.sum(torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[future_util_diag_mask]),0)*trans_mat[:,:],-1)
+        torch.sum(torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(control[future_util_diag_mask]),0)*trans_mat[:,:],-1)
+
+    # G_[counter : counter + n_types] = state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[P[f"pen_{1}"] : P[f"pen_{1}"] + n_types] - control[P[f"pen_u_{1}"] : P[f"pen_u_{1}"] + n_types] - \
+    #     torch.sum(torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[future_util_diag_mask]),0)*trans_mat[:,:],-1)
 
 
     counter += n_types
 
 
-    # fut_util_mat = torch.reshape(control[future_util_mask],(n_types,n_types))
-    # mat_tmp = torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(control[future_util_diag_mask]),0) - \
-    #     (utility_ind(torch.abs(torch.unsqueeze(shock_vec,0) + torch.unsqueeze(control[P[f"c_{1}"]:P[f"c_{1}"]+n_types],-1) - torch.unsqueeze(shock_vec,-1)), reg_c, sigma) + beta*(fut_util_mat))
-
-    fut_util_mat = torch.unsqueeze(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types],0) + torch.reshape(control[future_util_mask],(n_types,n_types))
-    mat_tmp = torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[future_util_diag_mask]),0) - \
+    fut_util_mat = torch.reshape(control[future_util_mask],(n_types,n_types))
+    mat_tmp = torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(control[future_util_diag_mask]),0) - \
         (utility_ind(torch.abs(torch.unsqueeze(shock_vec,0) + torch.unsqueeze(control[P[f"c_{1}"]:P[f"c_{1}"]+n_types],-1) - torch.unsqueeze(shock_vec,-1)), reg_c, sigma) + beta*(fut_util_mat))
+
+    # fut_util_mat = torch.unsqueeze(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types],0) + torch.reshape(control[future_util_mask],(n_types,n_types))
+    # mat_tmp = torch.unsqueeze(control[P[f"u_{1}"]:P[f"u_{1}"]+n_types] + beta*(state[S[f"w_{1}"] : S[f"w_{1}"] + n_types] + control[future_util_diag_mask]),0) - \
+    #     (utility_ind(torch.abs(torch.unsqueeze(shock_vec,0) + torch.unsqueeze(control[P[f"c_{1}"]:P[f"c_{1}"]+n_types],-1) - torch.unsqueeze(shock_vec,-1)), reg_c, sigma) + beta*(fut_util_mat))
 
     G_[counter : ] = mat_tmp[submatrix_mask]
 
@@ -278,16 +298,10 @@ class SpecifiedModel(DPGPScipyModel):
 
     def get_fit_precision(self,d,p):
         if p == 0:
-            if self.epoch <= self.cfg["n_feas_set_it"]:
-                rel_ll_change_tol = 0
-                relative_ll_grad_tol = 1e-5
-                relative_error_tol = 0
-                parameter_change_tol= 0
-            else:
-                rel_ll_change_tol = self.cfg["torch_optim"].get("relative_ll_change_tol_vf",1e-4)
-                relative_ll_grad_tol = self.cfg["torch_optim"].get("relative_ll_grad_change_tol_vf",1e-2)
-                relative_error_tol = self.cfg["torch_optim"].get("relative_error_tol_vf", 0)
-                parameter_change_tol= self.cfg["torch_optim"].get("parameter_change_tol_vf", 0)
+            rel_ll_change_tol = self.cfg["torch_optim"].get("relative_ll_change_tol_vf",1e-4)
+            relative_ll_grad_tol = self.cfg["torch_optim"].get("relative_ll_grad_change_tol_vf",1e-2)
+            relative_error_tol = self.cfg["torch_optim"].get("relative_error_tol_vf", 0)
+            parameter_change_tol= self.cfg["torch_optim"].get("parameter_change_tol_vf", 0)
 
         else:
             rel_ll_change_tol = self.cfg["torch_optim"].get("relative_ll_change_tol_pol",1e-4)
@@ -305,9 +319,6 @@ class SpecifiedModel(DPGPScipyModel):
             training_iter = self.cfg["torch_optim"].get("iter_per_cycle_vf",100)
             lr = self.cfg["torch_optim"].get("lr_vf",1e-3)
 
-        if self.epoch <= self.cfg["n_feas_set_it"]:
-            training_iter = 1000
-            lr = 0.1
 
         return training_iter, lr
 
@@ -321,78 +332,148 @@ class SpecifiedModel(DPGPScipyModel):
         return fit_lst
 
     def sample(self,no_samples_=None):
+        beta = self.cfg["model"]["params"]["beta"]
         n_types = self.cfg["model"]["params"]["n_types"]
         if no_samples_ is None:
             no_samples_ = self.cfg["no_samples"]
 
-        no_samples = no_samples_
-
-        #sample on [0,1] and later scale to right shape
-        sampler =  qmc.Halton(d=n_types, scramble=False)
-        state_sample_01 = torch.tensor(sampler.random(no_samples))
+        sampler = qmc.Halton(d=n_types, scramble=False)
 
         lower_w = scale_state_func(self.cfg["model"]["params"]["lower_w"],self.cfg)
         upper_w = scale_state_func(self.cfg["model"]["params"]["upper_w"],self.cfg)
-        state_sample = torch.zeros([0,n_types+1])
+        LB_state = torch.zeros(n_types)
+        UB_state = torch.zeros(n_types)
 
-        for indx_type in range(n_types):
-            LB_state = torch.zeros(n_types)
-            UB_state = torch.zeros(n_types)
+        for indxt in range(n_types):
+            LB_state[self.S[f"w_{indxt+1}"]] = lower_w[indxt]
+            UB_state[self.S[f"w_{indxt+1}"]] = upper_w[indxt]
 
-            for indxt in range(n_types):
-                LB_state[self.S[f"w_{indxt+1}"]] = lower_w[indxt]
-                UB_state[self.S[f"w_{indxt+1}"]] = upper_w[indxt]
-
-            # manual_pts = scale_state_func(torch.tensor([
-            #     [3.30933, 5.24347, 6.89751, 7.89606],
-            #     [17.8361, 18.2385, 18.7375, 19.1186],
-            #     [8.73155, 13.9954, 16.5601, 17.5221],
-            #     [5.63832, 8.86409, 13.8904, 15.9348],
-            #     [18.1423, 18.538, 19.0292, 19.4046],
-            #     [7.99439, 8.86317, 9.84819, 10.5484]
-            # ]), self.cfg)
-            manual_pts = scale_state_func(torch.tensor([[3.6789, 4.55191, 5.29423, 5.86329, 6.33018, 6.7339, 7.09424, 7.4197, 7.70555, 7.90964], 
-                                                        [17.8707, 17.9799, 18.1235, 18.2738, 18.4239, 18.5721, 18.7176, 18.8589, 18.9901, 19.0876], 
-                                                        [11.0892, 15.1522, 16.7708, 17.2927, 17.5364, 17.7081, 17.8595, 18.0023, 18.1339, 18.2315], 
-                                                        [8.72748, 10.7201, 14.7194, 16.2411, 16.7366, 16.9717, 17.1391, 17.286, 17.4186, 17.5163], 
-                                                        [7.682, 8.82175, 10.6903, 14.3609, 15.768, 16.2328, 16.458, 16.6194, 16.7557, 16.8543], 
-                                                        [6.96675, 7.90389, 8.91695, 10.565, 13.9958, 15.3195, 15.7611, 15.977, 16.1269, 16.2288], 
-                                                        [6.35034, 7.23886, 8.04666, 8.87665, 10.3798, 13.6312, 14.8911, 15.313, 15.5146, 15.6287], 
-                                                        [3.83698, 4.63504, 5.34627, 5.90558, 6.36892, 6.77099, 7.13035, 7.45515, 7.74051, 7.94429], 
-                                                        [3.76079, 4.59311, 5.31897, 5.8831, 6.3483, 6.75129, 7.11121, 7.4364, 7.72206, 7.92603], 
-                                                        [4.01827, 4.7458, 5.42449, 5.97185, 6.42992, 6.82913, 7.18664, 7.51005, 7.79436, 7.99748],
-                                                        [8.07762, 8.33908, 8.66483, 8.98653, 9.29108, 9.57789, 9.84836, 4.86446, 6.87322, 7.15439], 
-                                                        [10.484, 10.6774, 10.9253, 11.1775, 11.4225, 11.6583, 11.8845, 5.70337, 8.07501, 8.20778], 
-                                                        [12.4149, 12.5754, 12.7836, 12.9981, 13.2088, 13.4138, 13.6123, 6.43371, 9.11528, 9.14047], 
-                                                        [14.0791, 14.2193, 14.4024, 14.5922, 14.78, 14.9638, 15.1428, 7.08915, 10.0468, 9.98639], 
-                                                        [15.5653, 15.6914, 15.8566, 16.0287, 16.1998, 16.3678, 16.5321, 7.6889, 10.8983, 10.766], 
-                                                        [16.9212, 17.0367, 17.1885, 17.3471, 17.5052, 17.661, 17.8137, 8.24513, 11.6875, 11.4929], 
-                                                        [18.1763, 18.2835, 18.4247, 18.5725, 18.7202, 18.8661, 19.0094, 8.76612, 12.4265, 12.1764]]), self.cfg)            
-            dirichlet_sample = torch.distributions.dirichlet.Dirichlet(torch.ones(manual_pts.shape[0])).sample((no_samples,))
-            manual_pts = torch.matmul(dirichlet_sample,manual_pts)
-            state_sample_ = manual_pts
-
-            # state_sample_ = torch.unsqueeze(UB_state - LB_state,dim=0)*state_sample_01 + torch.unsqueeze(LB_state,dim=0)
-            # state_sample_ = torch.cat(
-            #     (
-            #         manual_pts,
-            #         state_sample_
-            #     ),dim=0
-            # )
-            no_samples = state_sample_.shape[0]
-
-            #copy sample points for each state and add the corresponding discrete state in the last entry of each row
-            state_sample = torch.cat(
-                (
-                    state_sample,
-                    torch.cat(
-                        (
-                            state_sample_,
-                            torch.ones(no_samples,1) * indx_type),1),
+        if self.epoch == 0:
+            #find n_types + 1 points in stationary subset of feas set and then uniformly sample on its convex hull
+            manual_pts = scale_state_func(torch.tensor([[3.6789,4.55191,5.29423,5.86329,6.33018,6.7339,7.09424,7.4197,7.70555,7.90964],
+                [17.8707,17.9799,18.1235,18.2738,18.4239,18.5721,18.7176,18.8589,18.9901,19.0876],
+                [11.0892,15.1522,16.7708,17.2927,17.5364,17.7081,17.8595,18.0023,18.1339,18.2315],
+                [8.72748,10.7201,14.7194,16.2411,16.7366,16.9717,17.1391,17.286,17.4186,17.5163],
+                [7.682,8.82175,10.6903,14.3609,15.768,16.2328,16.458,16.6194,16.7557,16.8543],
+                [4.86405,5.65632,6.36586,6.92807,7.40599,7.86719,8.46194,9.72167,12.5775,13.5992],
+                [3.73645,4.58045,5.3111,5.87671,6.34245,6.74568,7.10575,7.43103,7.71674,7.92075],
+                [4.6935,5.56674,6.31001,6.88283,7.36468,7.82781,8.42401,9.68594,12.5464,13.5696],
+                [4.9417,5.70207,6.39721,6.95426,7.42996,7.88992,8.48363,9.7417,12.5942,13.6147],
+                [3.80971,4.61967,5.33607,5.89716,6.36118,6.7636,7.12318,7.44812,7.73358,7.93743],
+                [4.7651,5.64009,6.39076,6.99308,7.59208,8.52035,10.3204,11.0865,11.4074,11.5719],
+                [3.79195,4.60991,5.32969,5.89189,6.35639,6.75904,7.11874,7.44377,7.72927,7.93316],
+                [6.96523,7.27926,7.6603,8.02747,8.36828,8.68446,8.97919,9.25321,9.49875,9.67638],
+                [6.945,7.32655,7.77295,8.19219,8.58296,8.98154,9.51505,10.6674,13.2933,14.2374],
+                [7.77358,8.8664,10.7149,14.377,15.7816,16.2457,16.4708,16.6321,16.7684,16.867],
+                [6.96675,7.90389,8.91695,10.565,13.9958,15.3195,15.7611,15.977,16.1269,16.2288],
+                [4.73607,5.39361,6.03626,6.56904,7.02287,7.43116,7.83969,8.37581,9.51199,12.0021],
+                [3.88512,4.66301,5.36531,5.92155,6.3836,6.785,7.14393,7.46841,7.75352,7.95714],
+                [4.17887,5.05194,5.79448,6.3644,6.83476,7.25225,7.66723,8.20965,9.3569,11.8701],
+                [5.77501,6.65179,7.41002,8.04245,8.76105,10.1642,13.2722,14.4785,14.877,15.0377],
+                [6.35034,7.23886,8.04666,8.87665,10.3798,13.6312,14.8911,15.313,15.5146,15.6287],
+                [4.24322,5.08388,5.81339,6.37948,6.84854,7.26545,7.68007,8.22219,9.36892,11.881],
+                [9.89532,10.1208,10.4068,10.6958,10.9814,11.2859,11.7048,12.6143,14.6824,15.4378],
+                [3.69348,4.55893,5.29825,5.86644,6.33306,6.73668,7.09696,7.42239,7.7082,7.91228],
+                [6.55072,6.97248,7.45406,7.89778,8.30595,8.71831,9.26636,10.4457,13.1305,14.0945],
+                [7.9005,8.36284,8.92692,9.62768,11.0097,14.0623,15.252,15.6563,15.8535,15.9666],
+                [5.22462,6.09855,6.84475,7.42925,7.9575,8.60482,9.93232,12.9182,14.0694,14.4084],
+                [5.11095,5.59313,6.12227,6.5936,7.00839,7.37959,7.71709,8.02535,8.29806,8.49366],
+                [7.06299,7.37151,7.74695,8.10967,8.44706,8.7605,9.05301,9.32521,9.56927,9.74592],
+                [4.75451,5.59685,6.32771,6.89686,7.37748,7.84004,8.43585,9.69721,12.5565,13.5794],
+                [8.76702,9.23558,9.95559,11.3839,14.5086,15.7255,16.1402,16.3493,16.4975,16.599],
+                [3.79899,4.61375,5.33221,5.89395,6.35825,6.7608,7.12046,7.44546,7.73096,7.93484],
+                [3.75451,4.5898,5.3169,5.88142,6.34676,6.74981,7.10977,7.43499,7.72065,7.92462],
+                [6.12012,6.49233,6.9295,7.33928,7.712,8.05276,8.36705,8.65699,8.9153,9.10144],
+                [3.72347,4.5738,5.30705,5.87346,6.33947,6.74283,7.10297,7.4283,7.71405,7.91808],
+                [3.68471,4.55468,5.29581,5.86453,6.33131,6.735,7.09531,7.42076,7.70659,7.91068],
+                [8.79238,9.05796,9.38876,9.71713,10.0367,10.3736,10.8352,11.8414,14.1369,14.9694],
+                [4.14795,4.83276,5.48987,6.0283,6.48203,6.87869,7.23445,7.55661,7.83998,8.04249],
+                [8.84208,9.15482,9.54488,9.96252,10.5153,11.6819,14.3206,15.3596,15.7161,15.8669],
+                [14.5572,14.6925,14.8694,15.0531,15.2352,15.4137,15.5877,15.7556,15.9108,16.0255],
+                [3.75243,4.58874,5.31625,5.88093,6.34631,6.74936,7.10932,7.43455,7.72022,7.9242],
+                [3.6874,4.55597,5.29655,5.86511,6.33184,6.7355,7.09581,7.42125,7.70708,7.91117],
+                [5.83632,6.68187,7.4275,8.05616,8.7734,10.1756,13.2821,14.4879,14.8862,15.0469],
+                [9.05957,12.3074,13.6468,14.1249,14.3825,14.5812,14.7615,14.9322,15.089,15.2048],
+                [3.84868,4.64172,5.35076,5.90937,6.37242,6.77435,7.13359,7.4583,7.74358,7.94733],
+                [4.73283,5.27715,5.85067,6.34786,6.77871,7.16079,7.50627,7.82067,8.09811,8.2968],
+                [4.80574,5.62389,6.34461,6.91055,7.38997,7.85195,8.44731,9.70799,12.5659,13.5883],
+                [6.59634,7.37088,8.12983,8.94305,10.4368,13.6762,14.9319,15.3528,15.5542,15.6682],
+                [3.78672,4.66204,5.41413,6.02211,6.59504,7.0241,7.37929,7.69446,7.9708,8.16843],
+                [5.42388,5.93225,6.48094,6.96467,7.39012,7.77967,8.17379,8.69505,9.80425,12.2377],
+                [8.18188,8.54381,8.98256,9.43994,10.0319,11.2651,14.0443,15.1336,15.5027,15.6564],
+                [4.80396,5.3353,5.89998,6.3922,6.82003,7.20013,7.54417,7.85747,8.13407,8.3322],
+                [5.33195,5.85599,6.41578,6.90596,7.3354,7.7277,8.12398,8.6475,9.76089,12.2032],
+                [7.21336,8.0352,8.99818,10.6264,14.0409,15.3592,15.7994,16.0149,16.1648,16.2666],
+                [4.80537,5.74417,6.48824,7.0466,7.51587,7.96919,8.55589,9.80195,12.629,13.641],
+                [5.14303,6.52335,7.32167,7.81088,8.19754,8.54643,8.90308,9.38123,10.4063,12.658],
+                [5.97292,6.35774,6.80639,7.22441,7.60305,7.94824,8.26598,8.55869,8.81919,9.00679],
+                [5.17899,5.73148,6.31064,6.81165,7.24764,7.64437,8.04412,8.57126,9.69127,12.1475],
+                [5.75544,6.41868,7.06761,7.61606,8.12789,8.7643,10.0773,13.0349,14.176,14.5126],
+                [9.89707,10.112,10.3854,10.6615,10.9294,11.1926,11.4727,11.8529,12.6605,14.4189],
+                [5.71659,6.12567,6.59569,7.02861,7.41777,7.77071,8.09445,8.39192,8.65619,8.84628],
+                [4.24181,4.89896,5.54121,6.07303,6.52338,6.918,7.27237,7.59349,7.87606,8.07806],
+                [4.04884,4.76579,5.43927,5.98454,6.44163,6.84027,7.19738,7.52052,7.80463,8.00762],
+                [3.76681,4.68669,5.42932,5.98791,6.44593,6.8431,7.19856,7.52031,7.80332,8.00559],
+                [4.52268,5.10975,5.711,6.22297,6.66243,7.05019,7.39974,7.71723,7.99704,8.19726],
+                [9.5956,11.2312,14.9609,16.3974,16.8714,17.1012,17.2672,17.4137,17.5462,17.644],
+                [5.35627,5.87608,6.43289,6.92136,7.34974,7.74131,8.13703,8.65997,9.77226,12.2122],
+                [8.49593,8.7421,9.05095,9.35812,9.65062,9.92737,10.1893,10.4358,10.6587,10.8209],
+                [5.51241,6.43893,7.65657,9.59543,10.4326,10.8129,11.0714,11.2912,11.4857,11.6272],
+                [8.40032,8.66494,8.99424,9.31951,9.6292,9.92903,10.245,10.6745,11.5966,13.6188],
+                [9.64038,9.85294,10.1235,10.3965,10.6599,10.9117,11.1522,11.38,11.5873,11.7388],
+                [4.50175,5.23449,5.91591,6.46515,6.92714,7.34028,7.75237,8.29203,9.43447,11.9377],
+                [5.45345,6.22168,6.92304,7.49295,8.01546,8.65944,9.98283,12.9609,14.1093,14.4476],
+                [4.18804,5.05633,5.79698,6.36637,6.83655,7.25397,7.66891,8.2113,9.35849,11.8715],
+                [3.80471,4.61691,5.33425,5.89563,6.35978,6.76227,7.12188,7.44686,7.73233,7.9362],
+                [8.68786,8.98003,9.34101,9.70232,10.0797,10.5878,11.6812,14.172,15.1467,15.4439],
+                [8.17393,9.10416,10.8652,14.4667,15.8516,16.3107,16.5345,16.6956,16.8318,16.9304],
+                [4.2262,4.88776,5.53245,6.06541,6.51637,6.91135,7.26595,7.58722,7.86993,8.07201],
+                [3.69367,4.55902,5.2983,5.86649,6.3331,6.73672,7.097,7.42242,7.70824,7.91232],
+                [7.76959,8.1223,8.54398,8.9536,9.37108,9.92244,11.0976,13.7683,14.8073,15.1197],
+                [4.01773,4.74546,5.42424,5.97164,6.42973,6.82896,7.18644,7.50986,7.79419,7.99731],
+                [3.68631,4.55546,5.29625,5.86487,6.33163,6.7353,7.0956,7.42105,7.70688,7.91097],
+                [8.07762,8.33908,8.66483,8.98653,9.29108,9.57789,9.84836,4.86446,6.87322,7.15439],
+                [10.484,10.6774,10.9253,11.1775,11.4225,11.6583,11.8845,5.70337,8.07501,8.20778],
+                [12.4149,12.5754,12.7836,12.9981,13.2088,13.4138,13.6123,6.43371,9.11528,9.14047],
+                [14.0791,14.2193,14.4024,14.5922,14.78,14.9638,15.1428,7.08915,10.0468,9.98639],
+                [15.5653,15.6914,15.8566,16.0287,16.1998,16.3678,16.5321,7.6889,10.8983,10.766],
+                [16.9212,17.0367,17.1885,17.3471,17.5052,17.661,17.8137,8.24513,11.6875,11.4929],
+                [18.1763,18.2835,18.4247,18.5725,18.7202,18.8661,19.0094,8.76612,12.4265,12.1764]]),self.cfg)
+            state_sample_ch = torch.from_numpy(sample_on_convex_hull(manual_pts.detach().numpy(), self.cfg["no_feas_samples"]))
+            state_sample_01 = torch.from_numpy(sampler.random(n=int(no_samples_)))
+            # state_sample_all = torch.unsqueeze(UB_state - LB_state,dim=0)*state_sample_01 + torch.unsqueeze(LB_state,dim=0)
+            epsilon = 0.05/(1-beta)
+            ball_sample = torch.from_numpy(sample_from_nd_ball(n_types, epsilon, num_samples=no_samples_))
+            state_sample_all = ball_sample + torch.from_numpy(sample_on_convex_hull(manual_pts.detach().numpy(), no_samples_))
+            # state_sample_all = ((epsilon)*state_sample_01 - 0.5 * epsilon) + torch.from_numpy(sample_on_convex_hull(manual_pts.detach().numpy(), no_samples_))
+            state_sample_all = torch.minimum(
+                UB_state,
+                torch.maximum(
+                    LB_state,
+                    state_sample_all
                 ),
-                dim=0,
             )
+            state_sample_ = torch.cat((state_sample_all,state_sample_ch),0)
+        
+        else:
+            #sample on [0,1] and later scale to right shape
+            state_sample_01 = torch.from_numpy(sampler.random(n=int(no_samples_)))
 
+            # manual_pts_bound_low = torch.ones([n_types,n_types]) * 0.5 * (upper_w + lower_w) + torch.eye(n_types) * (0.5 * lower_w - 0.5 * upper_w)
+            # center_w = 0.5 * (upper_w + lower_w)
+            # facet_pts = torch.eye(n_types) * lower_w + (torch.ones([n_types,n_types]) - torch.eye(n_types)) * center_w
+            state_sample_ = torch.unsqueeze(UB_state - LB_state,dim=0)*state_sample_01 + torch.unsqueeze(LB_state,dim=0)
+
+        no_samples = state_sample_.shape[0]
+
+        #copy sample points for each state and add the corresponding discrete state in the last entry of each row
+        state_sample = torch.cat(
+            (
+                state_sample_.repeat_interleave(self.discrete_state_dim,0),
+                torch.unsqueeze((torch.arange(self.discrete_state_dim)).repeat(no_samples),-1),
+            ),
+            dim=1,
+        )
 
         feasible = torch.ones(state_sample.shape[0])
         # test = self.unscale_state(state_sample)
@@ -449,8 +530,8 @@ class SpecifiedModel(DPGPScipyModel):
             if indxp == 0:  #first batch assume we stay at current util
                 for indxt1 in range(n_types):
                     for indxt2 in range(n_types):
-                        control[P[f"fut_util_{indxt1+1}_{indxt2+1}"]] = 0.
-                        # control[P[f"fut_util_{indxt1+1}_{indxt2+1}"]] = state[S[f"w_{indxt1+1}"]]
+                        # control[P[f"fut_util_{indxt1+1}_{indxt2+1}"]] = 0.
+                        control[P[f"fut_util_{indxt1+1}_{indxt2+1}"]] = state[S[f"w_{indxt2+1}"]]
 
             control[P[f"pen_{1}"]:P[f"pen_{1}"]+n_types] = 0.
             control[P[f"pen_u_{1}"]:P[f"pen_u_{1}"]+n_types] = 0.
@@ -460,7 +541,7 @@ class SpecifiedModel(DPGPScipyModel):
             policy_sample[indxp,:] = control[:]
         
         policy_sample_out = policy_sample#[indx_lst[:n_restarts],:]
-        if not (self.epoch == 1 or self.epoch == self.cfg["n_feas_set_it"])+1: 
+        if not (self.epoch == 1): 
             policy_sample_out[-1,:] = policy
 
         if not self.cfg.get("DISABLE_POLICY_FIT"):
@@ -487,7 +568,6 @@ class SpecifiedModel(DPGPScipyModel):
         disc_state = scaled_state[-1].type(torch.IntTensor)
         gp_offset = self.cfg["model"]["params"]["GP_offset"]
         lower_V = self.cfg["model"]["params"]["lower_V"]
-        n_feas_set_it = self.cfg["n_feas_set_it"]
 
         p_i = torch.unsqueeze(scaled_state[:-1], 0)
         obj_val = (self.M[int(scaled_state[-1].item())][0](p_i).mean[0] + gp_offset)
@@ -501,12 +581,9 @@ class SpecifiedModel(DPGPScipyModel):
 
     def is_feasible(self, scaled_state,value,control):
         lower_V = self.cfg["model"]["params"]["lower_V"]  
-        n_feas_set_it = self.cfg["n_feas_set_it"]  
         disc_state = scaled_state[-1].type(torch.IntTensor)
         gp_offset = self.cfg["model"]["params"]["GP_offset"]
-        if value <= 0. and self.epoch > n_feas_set_it:
-            return 0.0
-        elif self.epoch <= n_feas_set_it and value <= -1.:
+        if value <= 0.:
             return 0.0
         else:
             return 1.0
@@ -518,7 +595,6 @@ class SpecifiedModel(DPGPScipyModel):
         max_points = self.cfg["model"]["params"]["max_points"]
         error_tol = 1.0e-2
         n_types = self.cfg["model"]["params"]["n_types"]
-        n_feas_set_it = self.cfg["n_feas_set_it"]
         beta = self.cfg["model"]["params"]["beta"]
         pen_opt_vf = self.cfg["model"]["params"]["pen_opt_vf"]
         pen_cfg = self.cfg["model"]["params"]["pen_vf"]
@@ -529,11 +605,8 @@ class SpecifiedModel(DPGPScipyModel):
         total_pen = sum([ control[self.P[f"pen_{indxt}"]] for indxt in range(1,n_types+1)]) + \
             sum([ control[self.P[f"pen_u_{indxt}"]] for indxt in range(1,n_types+1)])
         
-        if self.epoch <= n_feas_set_it:
-            if self.epoch == 1:
-                pen_vf = 1.0
-            else:
-                pen_vf = 100.0
+        if self.epoch == 0:
+            pen_vf = 100000.
         else:
             pen_vf = pen_cfg
 
@@ -547,11 +620,7 @@ class SpecifiedModel(DPGPScipyModel):
             control[self.P[f"pen_{1}"]:self.P[f"pen_{1}"]+n_types] = 0.
             control[self.P[f"pen_u_{1}"]:self.P[f"pen_u_{1}"]+n_types] = 0.
 
-        if self.epoch <= n_feas_set_it:
-            gp_offset_feas = self.cfg["model"]["params"]["GP_offset_feas"]
-            out_val_adj = torch.round(torch.maximum( torch.tensor(0.), torch.minimum(torch.tensor(1.), out_val - gp_offset_feas)))
-        else:
-            out_val_adj = torch.minimum(upper_V - gp_offset, torch.maximum(torch.tensor(0.), out_val - gp_offset))
+        out_val_adj = torch.minimum(upper_V - gp_offset, torch.maximum(torch.tensor(0.), out_val - gp_offset))
 
         return control,  out_val_adj
 
@@ -564,7 +633,6 @@ class SpecifiedModel(DPGPScipyModel):
         shock_vals = self.cfg["model"]["params"]["shock_vec"]
         beta = self.cfg["model"]["params"]["beta"]
         pen_opt_vf = self.cfg["model"]["params"]["pen_opt_vf"]
-        n_feas_set_it = self.cfg["n_feas_set_it"]
         
         total = torch.tensor(0.)
         # for indxa in range(n_types):
@@ -580,7 +648,6 @@ class SpecifiedModel(DPGPScipyModel):
     def E_V(self, scaled_state, params, control):
         state = self.unscale_state(scaled_state)
         disc_state = state[-1].type(torch.IntTensor)
-        n_feas_set_it = self.cfg["n_feas_set_it"]
         """Caclulate the expectation of V"""
 
         e_v_next = 0
@@ -590,32 +657,14 @@ class SpecifiedModel(DPGPScipyModel):
         weights, points = self.state_iterate_exp(scaled_state, params, control)
         gp_offset = self.cfg["model"]["params"]["GP_offset"]
         for i in range(len(weights)):
-                p_i = torch.unsqueeze(points[i, :-1], 0)
+            p_i = torch.unsqueeze(points[i, :-1], 0)
+            with gpytorch.settings.fast_pred_var(), gpytorch.settings.max_root_decomposition_size(200):
                 obj_val = (self.M[int(points[i, -1].item())][0](p_i).mean + gp_offset)
-                e_v_next += (obj_val)  * weights[i]
-                # e_v_next -= 1000 * pen_opt_vf * (torch.nn.functional.relu(lower_V - obj_val))**2
+            e_v_next += (obj_val)  * weights[i]
+            # e_v_next -= 1000 * pen_opt_vf * (torch.nn.functional.relu(lower_V - obj_val))**2
 
         return e_v_next
 
-    def E_V_feas(self, scaled_state, params, control):
-        state = self.unscale_state(scaled_state)
-        disc_state = state[-1].type(torch.IntTensor)
-        n_feas_set_it = self.cfg["n_feas_set_it"]
-        """Caclulate the expectation of V"""
-
-        e_v_next = 0
-        gp_offset_feas = self.cfg["model"]["params"]["GP_offset_feas"]
-        weights, points = self.state_iterate_exp(scaled_state, params, control)
-        for i in range(len(weights)):
-                p_i = torch.unsqueeze(points[i, :-1], 0)
-                obj_val = torch.max(
-                    torch.tensor(-1),
-                    torch.min(
-                        torch.tensor(0.0),
-                        self.M[int(points[i, -1].item())][0](p_i).mean + gp_offset_feas))
-                e_v_next += (obj_val)
-
-        return e_v_next
 
     def state_next(self, scaled_state, params, control, zpy, opt=False):
         """Return next periods states, given the controls of today and the random discrete realization"""
@@ -628,8 +677,8 @@ class SpecifiedModel(DPGPScipyModel):
         # update discrete state
         s[-1] = 1.*zpy
         
-        s[S[f"w_{1}"]:S[f"w_{1}"]+n_types] = state[self.S[f"w_{1}"]:self.S[f"w_{1}"]+n_types] + control[self.P[f"fut_util_{int(zpy)+1}_{1}"]:self.P[f"fut_util_{int(zpy)+1}_{1}"] + n_types]
-        # s[S[f"w_{1}"]:S[f"w_{1}"]+n_types] = control[self.P[f"fut_util_{int(zpy)+1}_{1}"]:self.P[f"fut_util_{int(zpy)+1}_{1}"] + n_types]
+        # s[S[f"w_{1}"]:S[f"w_{1}"]+n_types] = state[self.S[f"w_{1}"]:self.S[f"w_{1}"]+n_types] + control[self.P[f"fut_util_{int(zpy)+1}_{1}"]:self.P[f"fut_util_{int(zpy)+1}_{1}"] + n_types]
+        s[S[f"w_{1}"]:S[f"w_{1}"]+n_types] = control[self.P[f"fut_util_{int(zpy)+1}_{1}"]:self.P[f"fut_util_{int(zpy)+1}_{1}"] + n_types]
 
         # for indx in range(n_types):
             # s[S[f"w_{indx+1}"]] = state[self.S[f"w_{int(zpy)+1}"]] + control[self.P[f"fut_util_{int(zpy)+1}_{indx+1}"]]
@@ -649,8 +698,8 @@ class SpecifiedModel(DPGPScipyModel):
         s[:,-1] = 1.* torch.arange(n_types)
         
         tmp_mat = torch.reshape(control[self.P[f"fut_util_{1}_{1}"]:self.P[f"fut_util_{1}_{1}"] + n_types**2],[n_types,n_types])
-        s[:,S[f"w_{1}"]:S[f"w_{1}"]+n_types] = torch.unsqueeze(state[self.S[f"w_{1}"]:self.S[f"w_{1}"]+n_types],0) + tmp_mat
-        # s[:,S[f"w_{1}"]:S[f"w_{1}"]+n_types] = tmp_mat
+        # s[:,S[f"w_{1}"]:S[f"w_{1}"]+n_types] = torch.unsqueeze(state[self.S[f"w_{1}"]:self.S[f"w_{1}"]+n_types],0) + tmp_mat
+        s[:,S[f"w_{1}"]:S[f"w_{1}"]+n_types] = tmp_mat
 
         return self.scale_state(s)
 
@@ -691,8 +740,8 @@ class SpecifiedModel(DPGPScipyModel):
         # X_L[P[f"fut_util_{1}_{1}"]:P[f"fut_util_{1}_{1}"]+n_types**2] = (lower_w[0])
         for indxa in range(n_types):
             for indxa2 in range(n_types):
-                X_L[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (lower_w[indxa2] - state[self.S[f"w_{indxa2 + 1}"]])
-
+                # X_L[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (lower_w[indxa2] - state[self.S[f"w_{indxa2 + 1}"]])
+                X_L[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (lower_w[indxa2])
         return X_L
 
     def ub(self, scaled_state, params):
@@ -708,15 +757,16 @@ class SpecifiedModel(DPGPScipyModel):
 
         beta = self.cfg["model"]["params"]["beta"]
         X_U = np.empty(self.control_dim)
-        X_U[P[f"u_{1}"]:P[f"u_{1}"]+n_types] = utility_ind(100 * upper_transfer, reg_c, sigma)
+        X_U[P[f"u_{1}"]:P[f"u_{1}"]+n_types] = utility_ind(1 * upper_transfer, reg_c, sigma)
         X_U[P[f"pen_{1}"]:P[f"pen_{1}"]+n_types] = 1000.
         X_U[P[f"pen_u_{1}"]:P[f"pen_u_{1}"]+n_types] = 1000.
-        X_U[P[f"c_{1}"]:P[f"c_{1}"]+n_types] = 100 * upper_transfer
+        X_U[P[f"c_{1}"]:P[f"c_{1}"]+n_types] = 1 * upper_transfer
         # X_U[P[f"fut_util_{1}_{1}"]:P[f"fut_util_{1}_{1}"]+n_types**2] = (upper_w[0])
 
         for indxa in range(n_types):
             for indxa2 in range(n_types):
-                X_U[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (upper_w[indxa2] - state[self.S[f"w_{indxa2 + 1}"]])
+                # X_U[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (upper_w[indxa2] - state[self.S[f"w_{indxa2 + 1}"]])
+                X_U[self.P[f"fut_util_{indxa+1}_{indxa2+1}"]] = (upper_w[indxa2])
 
         return X_U
 
@@ -797,7 +847,7 @@ class SpecifiedModel(DPGPScipyModel):
 
         return out_vec
     
-    def bal_utility_func(self, scaled_state,target_p,rho,beta,pen_val=torch.tensor([-1.0e10])):
+    def bal_utility_func(self, scaled_state,target_p,pen_val=torch.tensor([-1.0e10])):
         if scaled_state.ndim == 1:
             discrete_state = int(scaled_state[-1].item())
             eval_pt = torch.unsqueeze(scaled_state[:-1],0)
@@ -852,8 +902,6 @@ class SpecifiedModel(DPGPScipyModel):
         return out_vec
 
     def BAL(self):
-        if self.epoch <= self.cfg["n_feas_set_it"]: #if we are in the feasibility set iteration we do not do BAL
-            return None
         
         n_types = self.cfg["model"]["params"]["n_types"]
         lower_V = self.cfg["model"]["params"]["lower_V"]
@@ -903,7 +951,7 @@ class SpecifiedModel(DPGPScipyModel):
                 test_pt[:-1] = torch.unsqueeze(torch.from_numpy(point),dim=0)
                 self.cfg["model"]["params"]["max_points"][indxd,:] = test_pt[:-1]
                 test_pt[-1] = indxd
-                bal_util = self.bal_utility_func(test_pt,0,target.get("rho"),target.get("beta"), pen_val=torch.tensor([pen_val]))
+                bal_util = self.bal_utility_func(test_pt,0, pen_val=torch.tensor([pen_val]))
                 out_tmp[indxd,-1] = bal_util[0]
                 out_tmp[indxd,:(dim_state-1)] = test_pt[:-1]
                 out_tmp[indxd,-2] = 1.*indxd
@@ -964,17 +1012,20 @@ class SpecifiedModel(DPGPScipyModel):
                 #compare bal utility
                 
                 with torch.no_grad():
-                    bal_util = self.bal_utility_func(current_state,0,target.get("rho"),target.get("beta"), pen_val=torch.tensor([pen_val]))
+                    bal_util = self.bal_utility_func(current_state,0, pen_val=torch.tensor([pen_val]))
                     v = self.M[current_disc_state][0](current_state[:,:-1]).mean
+
+                if bal_util > out_tmp[current_disc_state,-1]:
+                    out_tmp[current_disc_state,:-1] = current_state[0,:]
+                    out_tmp[current_disc_state,-1] = bal_util[0]
 
                 #check of we need to abort sim because we walked somewhere nonsensical
                 if (v + gp_offset <= lower_V and indxt > 0 and self.epoch > n_rand_its):
                     print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
                     break
-
-                if bal_util > out_tmp[current_disc_state,-1]:
-                    out_tmp[current_disc_state,:-1] = current_state[0,:]
-                    out_tmp[current_disc_state,-1] = bal_util[0]
+                if v <= 0.0 and indxt > 0: # and self.epoch <= 300:
+                    print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
+                    break
 
                 cat_dist = torch.distributions.categorical.Categorical(trans_mat[current_disc_state,:])
                 next_disc_state = int((cat_dist.sample()).item())
@@ -1013,13 +1064,15 @@ class SpecifiedModel(DPGPScipyModel):
                     n_pts += 1
 
             out = torch.zeros([n_pts,dim_state])
+            final_bal_util = torch.zeros([n_pts])
             indxp = 0
             for indxd in range(self.cfg["model"]["params"]["discrete_state_dim"]):
                 if cand_pts[indxd,-1] > pen_val:
                     out[indxp,:] = cand_pts[indxd,:-1]
+                    final_bal_util[indxp] = cand_pts[indxd,-1]
                     indxp+=1
 
-            logger.info(f"BAL added points {out}")
+            logger.info(f"BAL added points {out} with final bal util {final_bal_util}")
             new_sample = out
             self.state_sample = torch.cat(
                 (
@@ -1062,10 +1115,8 @@ class SpecifiedModel(DPGPScipyModel):
     def iterate(self, training_iter=100):
 
         # fit pattern for GPs
-        n_feas_set_it = self.cfg["n_feas_set_it"]
-        if self.epoch == 0 or self.epoch == n_feas_set_it + 1:
+        if self.epoch == 0:
             fit_lst = self.only_fit_VF()
-            howard_lst = []
 
             # fit pol and vf in first iteration
             self.fit_GP(training_iter, fit_lst)
@@ -1074,7 +1125,6 @@ class SpecifiedModel(DPGPScipyModel):
 
         else:
             fit_lst = self.only_fit_VF()
-            howard_lst = self.only_fit_VF()
             
         # perform Howard improvment step
         vf_lst = self.only_fit_VF()
@@ -1209,23 +1259,27 @@ class SpecifiedModel(DPGPScipyModel):
 
 
     def create_model(self, d, p, train_x, train_y, warm_start=False):
-        if p == 0:
-            noise_vec = torch.zeros(train_y.shape[0])
-            noise_vec[:] = torch.ones(train_y.shape[0]) * 1e-5 
+        if self.cfg.get('use_fixed_noise',True):
+            if p == 0:
+                noise_vec = torch.zeros(train_y.shape[0])
+                noise_vec[:] = 1e-5
+
+            else:
+                noise_vec = 1e-5
+
+            self.likelihood[d][p] = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+                        noise_vec,
+                        learn_additional_noise=False
+                    ).to(self.device)
+
         else:
-            noise_vec = torch.ones(train_y.shape[0]) * 1e-5
-
-        self.likelihood[d][p] = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-                    noise_vec,
-                    learn_additional_noise=False
-                ).to(self.device)
-
-        # self.likelihood[d][p] = gpytorch.likelihoods.GaussianLikelihood(
-        #             noise_constraint=gpytorch.constraints.GreaterThan(1e-6)
-        #         ).to(self.device)
+            self.likelihood[d][p] = gpytorch.likelihoods.GaussianLikelihood(
+                        noise_constraint=gpytorch.constraints.GreaterThan(1e-7)
+                    ).to(self.device)
 
 
 
+        from GPModels.ExactGPModel import GPModel_pol
         if p > 0:
             model = GPModel_pol(
                         d,
@@ -1246,6 +1300,7 @@ class SpecifiedModel(DPGPScipyModel):
                     ).to(self.device)
 
 
+
         self.mll[d][p] = gpytorch.mlls.ExactMarginalLogLikelihood(
                     self.likelihood[d][p], model
                 )
@@ -1260,6 +1315,7 @@ class SpecifiedModel(DPGPScipyModel):
                 upper_w = self.cfg["model"]["params"]["upper_w"]
                 scale_bound = scale_state_func(upper_w,self.cfg)
                 length_scale_init = 1*scale_bound * torch.sqrt(torch.tensor(1.*n_types))
+                # model.covar_module.kernels[1].raw_constant.data.fill_((torch.tensor(1.0)))
             else:
                 upper_w = self.cfg["model"]["params"]["upper_w"]
                 scale_bound = scale_state_func(upper_w,self.cfg)
@@ -1310,13 +1366,10 @@ class SpecifiedModel(DPGPScipyModel):
                     d = int(self.state_sample[s, -1].item())
                     sample = self.state_sample[s, :-1]
                     sample = sample[self.get_d_cols(d)]
-                    if not self.cfg["model"].get("ONLY_POLICY_ITER"):
-                        self.V_sample[s] = (
-                            (self.M[d][0](torch.unsqueeze(sample, 0)) )
-                            .mean
-                        )
-                    else:
-                        self.V_sample[s] = 0.0
+                    self.V_sample[s] = (
+                        (self.M[d][0](torch.unsqueeze(sample, 0)) )
+                        .mean
+                    )
 
                     self.non_converged[s] = 1
                     self.feasible[s] = 1.0
@@ -1335,150 +1388,6 @@ class SpecifiedModel(DPGPScipyModel):
         )
 
 
-    def u_feas(self, scaled_state, params, control):
-        state = self.unscale_state(scaled_state)
-        n_types = self.cfg["model"]["params"]["n_types"]
-        pen_opt_vf = self.cfg["model"]["params"]["pen_opt_vf"]
-        
-        total = torch.tensor(0.)
-        for indxa in range(n_types):
-            total += - control[self.P[f"pen_{indxa+1}"]]*pen_opt_vf - control[self.P[f"pen_u_{indxa+1}"]]*pen_opt_vf
-        
-        return total  #lowest value will be greater than zero, useful for GP approximation of VF
-
-    def grad_u_feas(self, state, params, control):
-        c = control.clone().detach().requires_grad_(True)
-        u = self.u_feas(state, params, c)
-        u.backward()
-        return c.grad
-        
-    def eval_f_feas(self, state, params, control):
-        return self.u_feas(state,params,control) + self.E_V_feas(state, params, control)
-
-    def eval_grad_f_feas(self, state, params, control):
-        """Gradient wrt. control"""
-        return self.grad_u_feas(state,params,control) + self.grad_E_V_feas(state, params, control)
-
-    def grad_E_V_feas(self, state, params, control):
-        """Caclulate the gradient wrt. control of the expectation of V"""
-        c = control.clone().detach().requires_grad_(True)
-        e_v = self.E_V_feas(state, params, c)
-        e_v.backward()
-        return c.grad
-
-    
-    def solve(self, state, policy):
-        params = self.get_params(state,policy)
-        X_L = self.lb(state,params)
-        X_U = self.ub(state,params)
-        G_L = self.cl(state,params)
-        G_U = self.cu(state,params)
-        mask_eq = G_L == G_U
-        mask_ineq = np.logical_not(mask_eq)
-
-        if self.epoch <= self.cfg.get("n_feas_set_it", -1):
-            scipy_obj = ScipyModel_feas(
-                    self,
-                    state,
-                    params,
-                    lambda c: self.eval_g(state.detach(), params, c)[mask_eq],
-                    lambda c: self.eval_g(state.detach(), params, c)[mask_ineq],
-                    self.control_dim
-                )        
-        else:
-            scipy_obj = ScipyModel(
-                    self,
-                    state,
-                    params,
-                    lambda c: self.eval_g(state.detach(), params, c)[mask_eq],
-                    lambda c: self.eval_g(state.detach(), params, c)[mask_ineq],
-                    self.control_dim
-                )        
-
-        if sum(mask_eq) > 0:
-            nonlinear_constraints_eq = optimize.NonlinearConstraint(
-                scipy_obj.constraints_eq,
-                G_L[mask_eq],
-                G_U[mask_eq],
-                jac=scipy_obj.jacobian_constraints_eq,
-                hess=scipy_obj.hessian_constraints_eq,
-                )
-        if sum(mask_ineq) > 0:
-            nonlinear_constraints_ineq = optimize.NonlinearConstraint(
-                scipy_obj.constraints_ineq,
-                G_L[mask_ineq],
-                G_U[mask_ineq],
-                jac=scipy_obj.jacobian_constraints_ineq,
-                hess=scipy_obj.hessian_constraints_ineq,
-                )
-        if sum(mask_eq) > 0 and sum(mask_ineq) > 0:
-            constr_lst = [nonlinear_constraints_eq,nonlinear_constraints_ineq]
-        elif sum(mask_eq) == 0 and sum(mask_ineq) > 0:
-            constr_lst = nonlinear_constraints_ineq
-        elif sum(mask_eq) > 0 and sum(mask_ineq) == 0:         
-            constr_lst = nonlinear_constraints_eq
-        else:
-            constr_lst = []
-
-        var_bounds = optimize.Bounds(lb=X_L,ub=X_U,keep_feasible=True)
-
-        options_dict = {'maxiter': self.cfg["scipyopt"].get("maxiter", 200)}
-
-        if self.epoch <= self.cfg.get("n_feas_set_it", -1):
-            n_restarts = self.cfg["scipyopt"].get("no_restarts_feas", 1)
-        else:
-            n_restarts = self.cfg["scipyopt"].get("no_restarts", 1)
-        
-        start_pts = self.sample_start_pts(state, params, policy ,n_restarts)
-
-        x_vec = -1e10*np.ones((n_restarts,self.control_dim+2))
-        info_vec = -1*np.ones(n_restarts,dtype=np.int32)
-
-        n_iter_vec = np.zeros(n_restarts)
-        prim_feas_vec = np.zeros(n_restarts)
-        for indxit in range(n_restarts):
-            x_init = start_pts[indxit,:].clone().detach().numpy()
-            res = optimize.minimize(
-                scipy_obj.objective,
-                x_init,
-                method=self.cfg["scipyopt"].get("method", 'SLSQP'), #'trust-constr', 
-                jac=scipy_obj.gradient_obj, 
-                hess=scipy_obj.hessian_obj, 
-                bounds=var_bounds, 
-                constraints=constr_lst, 
-                tol=self.cfg["scipyopt"].get("tol", 1e-6),
-                options=options_dict)
-
-            info_vec[indxit] = res.success
-            n_iter_vec[indxit] =  res.nit
-            prim_feas_vec[indxit] = 0.#res.constr_violation
-            x_vec[indxit,0] = -1*res.fun
-            x_vec[indxit,2:] = res.x
-            if info_vec[indxit] == 1:
-                x_vec[indxit,1] = -1*res.fun
-        
-        mask = info_vec==1
-        x_converg = x_vec[mask,:]
-        if x_converg.shape[0] == 0:
-            logger.info(f"Scipy failed to converge in state {state} with return codes {info_vec} no iterations {n_iter_vec} prim feas {prim_feas_vec}")
-            raise NonConvergedError("Scipy did not converge (to acceptable tolerance)")
-
-        max_indx = np.argmax(x_vec[:,1])
-        # logger.info(f"Scipy converged in state {state} with return codes {info_vec[max_indx]} no iterations {n_iter_vec[max_indx]} prim feas {prim_feas_vec[max_indx]}")
-        logger.debug(state)
-        logger.debug(info_vec)
-        logger.debug(x_vec)
-        g_out = self.eval_g(state.detach(), params, torch.from_numpy(x_vec[max_indx,2:]))
-        logger.debug(g_out)
-
-        control,value = self.post_process_optimization(state, params, torch.from_numpy(x_vec[max_indx,2:]), torch.tensor(x_vec[max_indx,0]))
-        info_out = {}
-        info_out["obj_val"] = value
-        info_out["x"] = control
-
-        min_val = self.cfg["model"]["params"].get("min_val", -1.0e15)
-        return max(min_val,info_out["obj_val"]), info_out["x"]
-    
     def create_optimizer(self, d, p):
         train_iter,lr = self.get_solver_config(d,p)
         self.cfg["torch_optim"]["config"]["lr"] = lr
@@ -1528,8 +1437,30 @@ class SpecifiedModel(DPGPScipyModel):
                 lower_V = self.cfg["model"]["params"]["lower_V"]
                 gp_offset = self.cfg["model"]["params"]["GP_offset"]
                 mask_feas = train_vf + gp_offset >= lower_V
+                # mask_feas = train_vf >= 0.001
                 train_v = (train_v[mask_feas]).contiguous()
                 train_sample = (train_sample[mask_feas,:]).contiguous()
+            if p == 0:
+                no_init_pts = self.cfg["no_feas_samples"] + self.cfg["no_samples"]
+                mask_feas_init = train_v[:no_init_pts] >= 0.0001
+                mask_infeas_init = torch.logical_not(mask_feas_init)
+                init_feas_samples = train_sample[:no_init_pts,...][mask_feas_init,...]
+                init_feas_train_v = train_v[:no_init_pts][mask_feas_init]
+                init_infeas_samples = train_sample[:no_init_pts,...][mask_infeas_init,...]
+                init_infeas_train_v = train_v[:no_init_pts][mask_infeas_init]
+
+                n_types = self.cfg["model"]["params"]["n_types"]
+                train_sample = torch.cat((
+                    init_feas_samples,
+                    init_infeas_samples[:n_types+1,...],
+                    train_sample[no_init_pts:,:]
+                ),dim=0).contiguous()
+                train_v = torch.cat((
+                    init_feas_train_v,
+                    init_infeas_train_v[:n_types+1],
+                    train_v[no_init_pts:]
+                ),dim=0).contiguous()
+
 
 
             self.M[d][p] = self.create_model(d, p, train_sample, train_v, warm_start)
@@ -1572,114 +1503,3 @@ class SpecifiedModel(DPGPScipyModel):
         logger.info(
             f"Interpolation error: {metrics_int['l_inf']} (L_inf) {metrics_int['l2']} (L2) for state policy pairs {dp}"
         )
-
-
-class ScipyModel_feas:
-    def __init__(self, DPGM, state, params, eval_g_eq, eval_g_ineq, control_dim):
-        self._DPGM = DPGM
-        self._state = state
-        self._params = params
-        self._eval_g_eq = eval_g_eq
-        self._eval_g_ineq = eval_g_ineq
-        self._control_dim = control_dim
-
-
-    def eval_hessian_f(self, x):
-        h = torch.autograd.functional.hessian(
-            lambda y: self._DPGM.eval_f_feas(self._state,self._params, y),
-            x,
-            vectorize=True,
-        )
-        return h
-
-    # cpyipopt requirements
-    def objective(self, x):
-        """Returns the scalar value of the objective given x."""
-        return (
-            -1*self._DPGM.eval_f_feas(self._state,self._params, torch.from_numpy(x)).detach().cpu().numpy()
-        )
-
-    def gradient_obj(self, x):
-        """Returns the gradient of the objective with respect to x."""
-        return (
-            -1*self._DPGM.eval_grad_f_feas(self._state,self._params, torch.from_numpy(x))
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-    def hessian_obj(self, x):
-        """Returns the gradient of the objective with respect to x."""
-        return (
-            -1*self.eval_hessian_f(torch.from_numpy(x))
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-    def eval_jac_g_eq(self, x):
-        jac = torch.autograd.functional.jacobian(self._eval_g_eq, x)
-        return jac
-
-    def eval_hessian_g_eq(self, x, lagrange):
-        L = torch.from_numpy(lagrange)
-        h = torch.autograd.functional.hessian(
-            lambda y: torch.dot(
-                self._eval_g_eq(y),
-                L,
-            ),
-            x,
-            vectorize=True,
-        )
-        return h
-
-    def constraints_eq(self, x):
-        """Returns the constraints."""
-        return self._eval_g_eq(torch.from_numpy(x)).detach().numpy()
-
-    def jacobian_constraints_eq(self, x):
-        """Returns the Jacobian of the constraints with respect to x."""
-        return self.eval_jac_g_eq(torch.from_numpy(x)).detach().cpu().numpy()
-
-    def hessian_constraints_eq(self, x, lagrange):
-        h = (
-            self.eval_hessian_g_eq(torch.from_numpy(x), lagrange)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        return h
-
-
-    def eval_jac_g_ineq(self, x):
-        jac = torch.autograd.functional.jacobian(self._eval_g_ineq, x)
-        return jac
-
-    def eval_hessian_g_ineq(self, x, lagrange):
-        L = torch.from_numpy(lagrange)
-        h = torch.autograd.functional.hessian(
-            lambda y: torch.dot(
-                self._eval_g_ineq(y),
-                L,
-            ),
-            x,
-            vectorize=True,
-        )
-        return h
-
-    def constraints_ineq(self, x):
-        """Returns the constraints."""
-        return self._eval_g_ineq(torch.from_numpy(x)).detach().numpy()
-
-    def jacobian_constraints_ineq(self, x):
-        """Returns the Jacobian of the constraints with respect to x."""
-        return self.eval_jac_g_ineq(torch.from_numpy(x)).detach().cpu().numpy()
-
-    def hessian_constraints_ineq(self, x, lagrange):
-        h = (
-            self.eval_hessian_g_ineq(torch.from_numpy(x), lagrange)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        return h

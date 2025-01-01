@@ -2,9 +2,36 @@ import importlib
 import torch
 
 def dynamic_params(cfg):
-    """Dynamic parameter transforms"""
+
+    cfg["warm_start"] = False #warm start for gp fitting
+    cfg["use_fixed_noise"] = True #use fixed noise for likelyhood
+    cfg["drop_non_converged"] = True #drop non converged points from the training set
+
+    cfg["torch_optim"]["relative_ll_change_tol_vf"] = 0
+    cfg["torch_optim"]["relative_ll_grad_change_tol_vf"] = 0
+    cfg["torch_optim"]["relative_error_tol_vf"] = 0
+    cfg["torch_optim"]["parameter_change_tol_vf"] = 1e-3
+
+    cfg["torch_optim"]["relative_ll_change_tol_pol"] = 0
+    cfg["torch_optim"]["relative_ll_grad_change_tol_pol"] = 0
+    cfg["torch_optim"]["relative_error_tol_pol"] = 0
+    cfg["torch_optim"]["parameter_change_tol_pol"] = 1e-3
+
+    ### Define constants
+    cfg["model"]["params"]["n_types"] = 2
+    cfg["model"]["params"]["beta"] = 0.9
+    cfg["model"]["params"]["upper_trans"] = 1.
+    cfg["model"]["params"]["lower_trans"] = 0.
+    cfg["model"]["params"]["upper_shock"] = 0.35
+    cfg["model"]["params"]["lower_shock"] = 0.1
+    cfg["model"]["params"]["sigma"] = 0.5
+    cfg["model"]["params"]["reg_c"] = 0.0001
+    cfg["model"]["params"]["pen_opt_vf"] = 50.
+    cfg["model"]["params"]["pen_vf"] = 10.0
+    cfg["model"]["params"]["n_Howard_steps"] = 0   
+
     model = importlib.import_module(
-            cfg["model"]["MODEL_NAME"] + ".Model"
+            cfg["MODEL_NAME"] + ".Model"
         )
     upper_shock = cfg["model"]["params"]["upper_shock"]
     lower_shock = cfg["model"]["params"]["lower_shock"]

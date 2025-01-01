@@ -39,7 +39,6 @@ class DPGPModel(ABC):
         state_names=[],
     ):
         self.current_ll = 0
-        self.current_p_ll = 0
         self.epoch = 0
         self.discrete_state_dim = discrete_state_dim
         self.state_sample = state_sample
@@ -209,7 +208,10 @@ class DPGPModel(ABC):
                         )
                     ).to(self.device)
 
-        model = self.Model(
+        import importlib
+        gp_model = importlib.import_module(self.cfg["MODEL_NAME"] + ".GPModel")
+
+        model = gp_model.GPModel(
                     d,
                     p,
                     train_x,
@@ -874,7 +876,6 @@ class DPGPModel(ABC):
         if not self.cfg.get("distributed") or dist.get_rank() == 0:
             torch.save(
                 {
-                    "beta": self.beta,
                     "epoch": self.epoch,
                     "discrete_state_dim": self.discrete_state_dim,
                     "policy_dim": self.policy_dim,
@@ -895,7 +896,6 @@ class DPGPModel(ABC):
                     "feasible_all": self.feasible_all,
                     "combined_sample_all": self.combined_sample_all,
                     "rng_state": torch.get_rng_state(),
-                    "metrics": self.metrics,
                 },
                 save_path,
             )
@@ -991,11 +991,9 @@ class DPGPModel(ABC):
         cf = checkpoint["cfg"]
         cf.update(cfg_override)
         dpgp = cls(
-            beta=checkpoint["beta"],
             cfg=cf,
             state_sample=checkpoint["state_sample_all"],
             V_sample=checkpoint["combined_sample_all"][:, 0],
-            metrics=checkpoint.get("metrics", {}),
             policy_sample=checkpoint["combined_sample_all"][:, 1:],
             **kwargs
         )

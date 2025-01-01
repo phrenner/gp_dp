@@ -26,8 +26,6 @@ def set_conf(cfg):
     logger.info("Original configuration:")
     logger.info(OmegaConf.to_yaml(cfg_run))
     model = importlib.import_module(cfg_run.model.MODEL_NAME + ".Model")
-    gp_model = importlib.import_module("GPModels." + cfg_run.model.GP_MODEL.name)
-    expect = importlib.import_module("ExpectOps." + cfg_run.model.EXPECT_OP.name)
 
     # RNG
     torch.manual_seed(0)
@@ -79,16 +77,12 @@ def set_conf(cfg):
         path=CHECKPOINT_FILE,
         # no override, use saved params
         cfg_override={"distributed": False, "init_with_zeros": False},
-        Model=gp_model.GPModel,
-        ExpectOps=expect.ExpectOps,
     )
     try:
         m_prev = model.SpecifiedModel.load(
             path=CHECKPOINT_FILE_PREV,
             # no override, use saved params
             cfg_override={"distributed": False, "init_with_zeros": False},
-            Model=gp_model.GPModel,
-            ExpectOps=expect.ExpectOps,
         )
     except:
         m_prev = m
@@ -114,15 +108,11 @@ def set_conf(cfg):
                 path=checkpoints[i],
                 # no override, use saved params
                 cfg_override={"distributed": False, "init_with_zeros": False},
-                Model=gp_model.GPModel,
-                ExpectOps=expect.ExpectOps,
             )
             m2 = model.SpecifiedModel.load(
                 path=checkpoints[i + 1],
                 # no override, use saved params
                 cfg_override={"distributed": False, "init_with_zeros": False},
-                Model=gp_model.GPModel,
-                ExpectOps=expect.ExpectOps,
             )
             pp.compare(m1, m2, cfg)
 

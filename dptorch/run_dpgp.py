@@ -63,29 +63,36 @@ def set_conf(cfg):
     torch.manual_seed(cfg["mc_seed"])
 
     model = importlib.import_module(cfg["MODEL_NAME"] + ".Model")
-    importlib.import_module(cfg["MODEL_NAME"] + ".Params")
 
     try:
         # dynamic parameters
-        cfg = importlib.import_module(cfg["MODEL_NAME"] + ".Params")
+        cfg = importlib.import_module(
+            cfg["MODEL_NAME"] + ".Params"
+        ).dynamic_params(cfg)
+        try:
+            # adjust learning rate
+            if 'lr' in cfg['torch_optim']['config'] and cfg['override_checkpoint_configs_optimizer']:
+                cfg['torch_optim']['config']['lr'] /= cfg['no_samples']
+                logger.info(f"Learning rate adjusted with the number of points. Effective LR: {cfg['torch_optim']['config']['lr']}")
+        except:
+            logger.debug("No learning rate detected, not adjusted.")
     except FileNotFoundError:
-        logger.error(
-            "No Params.py found."
+        logger.warning(
+            "No Params.py found - continuing with using only parameters from yaml file."
         )
-        return None
     except AttributeError:
         logger.warning(
             "No method named `dynamic_params` found in Params.py - continuing using only parameters from yaml file."
         )
 
-
     logger.info("Running with parameters: " + str(cfg))
+
 
     save_file = None
     if cfg["STARTING_POINT"] == "NEW":
         pass
     elif cfg["STARTING_POINT"] == "LATEST":
-        model_dir = f"{get_original_cwd()}/runs/{cfg['model']['MODEL_NAME']}"
+        model_dir = f"{get_original_cwd()}/runs/{cfg['MODEL_NAME']}"
         date_dirs = sorted([elem for elem in pathlib.Path(model_dir).iterdir() if elem.is_dir()], key=lambda elem: elem.name, reverse=True)
         for date_dir in date_dirs:
             time_dirs = sorted([elem for elem in date_dir.iterdir() if elem.is_dir()], key=lambda elem: elem.name, reverse=True)
