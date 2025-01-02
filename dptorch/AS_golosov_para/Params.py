@@ -7,6 +7,14 @@ def dynamic_params(cfg):
     cfg["use_fixed_noise"] = True #use fixed noise for likelyhood
     cfg["drop_non_converged"] = True #drop non converged points from the training set
 
+    cfg["BAL"] = {"enabled" : True}
+    cfg["BAL"]["epoch_freq"] = 30
+    cfg["BAL"]["max_points"] = 10000
+
+    cfg["torch_optim"] = {}
+    cfg["torch_optim"]["LR"] = 1e-3
+    cfg["torch_optim"]["iter_per_cycle"] = 10000
+
     cfg["torch_optim"]["relative_ll_change_tol_vf"] = 0
     cfg["torch_optim"]["relative_ll_grad_change_tol_vf"] = 0
     cfg["torch_optim"]["relative_error_tol_vf"] = 0
@@ -17,7 +25,13 @@ def dynamic_params(cfg):
     cfg["torch_optim"]["relative_error_tol_pol"] = 0
     cfg["torch_optim"]["parameter_change_tol_pol"] = 1e-3
 
+    cfg["scipyopt"]["maxiter"] = 400
+    cfg["scipyopt"]["no_restarts"] = 3
+    cfg["scipyopt"]["method"] = "SLSQP"
+    cfg["scipyopt"]["tol"] = 1e-6
+    
     ### Define constants
+    cfg["model"] = {"params":{}}
     cfg["model"]["params"]["n_types"] = 2
     cfg["model"]["params"]["beta"] = 0.9
     cfg["model"]["params"]["upper_trans"] = 1.
@@ -77,13 +91,5 @@ def dynamic_params(cfg):
     cfg["model"]["params"]["max_penalty"] = 1.0
     cfg["model"]["params"]["GP_offset"] = cfg["model"]["params"]["lower_V"] - cfg["model"]["params"]["max_penalty"] #/(1-beta) #translate the gp by this amount
 
-    if not "no_samples" in cfg:
-        cfg["no_samples"] = 16
-
-    # used for expectations
-    if cfg["model"]["EXPECT_OP"]["name"] != "SinglePoint":
-        cfg["model"]["EXPECT_OP"]["config"]["mc_std"] = [
-            cfg["model"]["EXPECT_OP"]["config"]["sigma"]
-        ] * cfg["model"]["params"]["n_types"]
 
     return cfg

@@ -217,21 +217,11 @@ class SpecifiedModel(DPGPScipyModel):
 
     def create_optimizer(self, d, p):
         train_iter,lr = self.get_solver_config(d,p)
-        self.cfg["torch_optim"]["config"]["lr"] = lr
-        return  getattr(torch.optim, self.cfg["torch_optim"]["name"])(
-                    self.M[d][p].parameters(), **self.cfg["torch_optim"]["config"]
-                )
+        return  torch.optim.Adam(self.M[d][p].parameters(),lr = lr)
 
     def get_solver_config(self,d,p):
-        if p > 0:
-            training_iter = self.cfg["torch_optim"].get("iter_per_cycle_pol",100)
-            lr = self.cfg["torch_optim"].get("lr_pol",1e-3)
-        else:
-            training_iter = self.cfg["torch_optim"].get("iter_per_cycle_vf",100)
-            if self.epoch <= self.cfg["n_feas_set_it"]:
-                lr = 0.1
-
-            lr = self.cfg["torch_optim"].get("lr_vf",1e-3)
+        training_iter = self.cfg["torch_optim"].get("iter_per_cycle",100)
+        lr = self.cfg["torch_optim"].get("LR",1e-3)
 
         return training_iter, lr
 
@@ -401,22 +391,6 @@ class SpecifiedModel(DPGPScipyModel):
         policy_sample_out = policy_sample#[indx_lst[:n_restarts],:]
         scale_vec = self.scale_policy()
         policy_sample_out[-1,:] = policy*scale_vec
-
-        if not self.cfg.get("DISABLE_POLICY_FIT"):
-            pol_inter = torch.zeros(policy_sample.shape[-1])
-            eval_pt = torch.unsqueeze(state[:-1],dim=0)
-            for indxp in range(policy_sample.shape[-1]):
-                try:
-                    pol_inter[indxp] = torch.minimum(
-                        UB[indxp],
-                        torch.maximum(
-                            LB[indxp],
-                            self.M[disc_state][1 + indxp](eval_pt).mean
-                        ),
-                    )
-                    policy_sample_out[-2,indxp] = pol_inter[indxp]
-                except:
-                    logger.info(f"state {disc_state} policy {indxp} evaluation failed in sample_stps.")
 
         return policy_sample_out
         
