@@ -30,6 +30,7 @@ class DPGPModel(ABC):
         self,
         V_guess=None,
         cfg={},
+        metrics = {},
         state_sample=torch.tensor([]),
         V_sample=torch.tensor([]),
         policy_sample=torch.tensor([]),
@@ -42,6 +43,7 @@ class DPGPModel(ABC):
         self.epoch = 0
         self.discrete_state_dim = discrete_state_dim
         self.state_sample = state_sample
+        self.metrics 
 
         if cfg.get("WORKER_MAIN_LOG_LEVEL", False) and rank > 0:
             main_logger.setLevel(cfg["WORKER_MAIN_LOG_LEVEL"])
@@ -676,13 +678,10 @@ class DPGPModel(ABC):
     def iterate(self, training_iter=100):
 
         # fit GP to current sample
-        if not self.cfg["model"].get("ONLY_POLICY_ITER"):
-            if self.epoch > 0:
-                self.fit_GP(training_iter, self.what_to_fit(), self.warm_start)
-            else:
-                self.fit_GP(training_iter, self.what_to_fit())
+        if self.epoch > 0:
+            self.fit_GP(training_iter, self.what_to_fit(), self.warm_start)
         else:
-            self.policy_fit(training_iter)
+            self.fit_GP(training_iter, self.what_to_fit())
 
         if self.epoch == 0:
             self.save()
@@ -710,15 +709,11 @@ class DPGPModel(ABC):
             f"Difference between previous interpolated values & next iterated values: {self.metrics[str(self.epoch)]['l_inf']} (L_inf) {self.metrics[str(self.epoch)]['l2']} (L2) for state policy pairs {fit_lst}"
         )
 
-        if self.epoch % self.cfg.get("CHECKPOINT_INTERVAL", 10) == 0:
-            if not self.cfg.get("DISABLE_POLICY_FIT") and not self.cfg["model"].get(
-                "ONLY_POLICY_ITER"
-            ):
-                self.policy_fit(training_iter)
+        if self.epoch % self.cfg.get("CHECKPOINT_INTERVAL", 1) == 0:
             self.save()
 
     def eval_f(self, state, params, control):
-        return self.u(state, params, control) + self.beta * self.E_V(state, params, control)
+        return self.u(state, params, control) + self.cfg["model"]["params"]["beta"] * self.E_V(state, params, control)
 
     def grad_u(self, state, params, control):
         c = control.clone().detach().requires_grad_(True)
@@ -728,7 +723,7 @@ class DPGPModel(ABC):
 
     def eval_grad_f(self, state, params, control):
         """Gradient wrt. control"""
-        return self.grad_u(state, params, control) + self.beta * self.grad_E_V(state, params, control)
+        return self.grad_u(state, params, control) + self.cfg["model"]["params"]["beta"] * self.grad_E_V(state, params, control)
 
     def is_feasible(self,state,V,pol):
         return 1.0
@@ -767,13 +762,10 @@ class DPGPModel(ABC):
                     d = int(self.state_sample[s, -1].item())
                     sample = self.state_sample[s, :-1]
                     sample = sample[self.get_d_cols(d)]
-                    if not self.cfg["model"].get("ONLY_POLICY_ITER"):
-                        self.V_sample[s] = (
-                            (self.M[d][0](torch.unsqueeze(sample, 0)) )
-                            .mean
-                        )
-                    else:
-                        self.V_sample[s] = 0.0
+                    self.V_sample[s] = (
+                        (self.M[d][0](torch.unsqueeze(sample, 0)) )
+                        .mean
+                    )
 
                     self.non_converged[s] = 1
                     self.feasible[s] = 1.0
@@ -1092,6 +1084,8 @@ class DPGPModel(ABC):
             self.feasible = self.feasible_all
             self.combined_sample = self.combined_sample_all
             self.state_sample = self.state_sample_all
+
+
     def sample_all(self, init_sample=None):
         if init_sample is None:
             if self.epoch == 0:
@@ -1101,55 +1095,13 @@ class DPGPModel(ABC):
                 self.prev_state_sample = self.state_sample_all.clone()
                 self.prev_combined_sample = self.combined_sample_all.clone()
                 self.prev_feasible = self.feasible_all.clone()
-                if self.cfg.get("resample_method") == "random":
-                    self.sample(self.cfg.get("resample_num_new",1000))
-                elif self.cfg.get("resample_method") == "dynamic":
-                    # Pull a new state accoriding to weights randomly
-                    # Use method: https://discuss.pytorch.org/t/torch-equivalent-of-numpy-random-choice/16146/14
-                    # sample next state
-                    new_state_sample = torch.tensor([])
-                    for s_ind in range(self.state_sample_all.shape[0]):
-                        if self.prev_feasible[s_ind] == 1:
-                            params = self.get_params(
-                                    self.state_sample_all[s_ind],
-                                    self.policy_sample_all[s_ind][: self.policy_dim])
-                            weights, points = self.state_iterate_exp(
-                                self.state_sample_all[s_ind],
-                                params,
-                                self.policy_sample_all[s_ind][: self.policy_dim],
-                            )
-                            if self.cfg.get("resample_num_new") < 0:
-                                new_state_sample = torch.cat(
-                                    (new_state_sample, points), dim=0
-                                )
-                            elif (
-                                self.cfg.get("resample_num_new") <= weights.shape[0]
-                            ):
-                                sample_idx = weights.multinomial(
-                                    num_samples=self.cfg.get("resample_num_new"),
-                                    replacement=False,
-                                )
-                                new_state_sample = torch.cat(
-                                    (new_state_sample, points[sample_idx]), dim=0
-                                )
-                            else:
-                                sys.stderr.write(
-                                    f"Config value of resample_num_new must not exceed the number of possible future states ({int(weights.shape[0])})"
-                                )
-                                sys.exit(1)
 
-                    self.state_sample = new_state_sample
-                elif self.cfg.get("resample_method") == "disabled":
-                    self.state_sample = self.state_sample_all
-                    self.feasible = self.feasible_all
-                    self.combined_sample = self.combined_sample_all
-                else:
-                    sys.stderr.write(
-                        f'Unrecognised config value for resample_method: {self.cfg.get("resample_method")}'
-                    )
-                    sys.exit(1)
+                self.state_sample = self.state_sample_all
+                self.feasible = self.feasible_all
+                self.combined_sample = self.combined_sample_all
+
                 # do Bayesian Active Learning
-                if self.cfg["BAL"].get("enabled"):
+                if self.cfg["BAL"].get("enabled", False):
                     if (
                         self.epoch % self.cfg["BAL"].get("epoch_freq", 5) == 0
                         and (
