@@ -3,7 +3,7 @@ import torch
 
 def dynamic_params(cfg):
 
-    cfg["no_samples"] = 8
+    cfg["no_samples"] = 64
     cfg["warm_start"] = False #warm start for gp fitting
     cfg["use_fixed_noise"] = True #use fixed noise for likelyhood
     cfg["drop_non_converged"] = True #drop non converged points from the training set
@@ -11,7 +11,7 @@ def dynamic_params(cfg):
 
     cfg["BAL"] = {"enabled" : True}
     cfg["BAL"]["epoch_freq"] = 30
-    cfg["BAL"]["max_points"] = 100
+    cfg["BAL"]["max_points"] = 100000
 
     cfg["torch_optim"] = {}
     cfg["torch_optim"]["LR"] = 1e-1
@@ -44,7 +44,7 @@ def dynamic_params(cfg):
     cfg["model"]["params"]["reg_c"] = 0.0001
     cfg["model"]["params"]["pen_opt_vf"] = 50.
     cfg["model"]["params"]["pen_vf"] = 10.0
-    cfg["model"]["params"]["n_Howard_steps"] = 0   
+    cfg["model"]["params"]["n_Howard_steps"] = 50   
 
     model = importlib.import_module(
             cfg["MODEL_NAME"] + ".Model"

@@ -1,9 +1,9 @@
 import torch
 import gpytorch
 import numpy as np
-from DPGPIpoptModel import DPGPIpoptModel,IpoptModel
+# from DPGPIpoptModel import DPGPIpoptModel,IpoptModel
 from DPGPScipyModel import DPGPScipyModel
-import cyipopt
+# import cyipopt
 from typing import List, Tuple
 import copy
 from Utils import NonConvergedError
@@ -234,11 +234,11 @@ class SpecifiedModel(DPGPScipyModel):
                 for indxa2 in range(n_types):
                     fit_lst.append((indxs,1 + self.P[f"fut_util_{indxa1+1}_{indxa2+1}"]))
 
-            for indxa1 in range(n_types):
-                fit_lst.append((indxs,1 + self.P[f"c_{indxa1+1}"]))
+            # for indxa1 in range(n_types):
+            #     fit_lst.append((indxs,1 + self.P[f"c_{indxa1+1}"]))
 
-            for indxa1 in range(n_types):
-                fit_lst.append((indxs,1 + self.P[f"u_{indxa1+1}"]))
+            # for indxa1 in range(n_types):
+            #     fit_lst.append((indxs,1 + self.P[f"u_{indxa1+1}"]))
 
         return fit_lst
 
@@ -609,27 +609,38 @@ class SpecifiedModel(DPGPScipyModel):
 ##############################################################################################################################
 
 
-    def bal_utility_func(self, scaled_state,target_p,rho,beta,pen_val=torch.tensor([-1.0e10])):
-        if scaled_state.ndim == 1:
-            discrete_state = int(scaled_state[-1].item())
-            eval_pt = torch.unsqueeze(scaled_state[:-1],0)
-        elif scaled_state.ndim == 2:
-            discrete_state = int(scaled_state[0,-1].item())
-            assert torch.min(scaled_state[:,-1] == scaled_state[0,-1]), f"Something wrong with discrete states {scaled_state}"
-            eval_pt = scaled_state[:,:-1]
+    def bayesian_opt_criterion(self, eval_pt,discrete_state, target_p, rho, beta, pen_val=torch.tensor([-1.0e10])):
 
-        eval_pt = (eval_pt[:,self.get_d_cols(discrete_state)])
+        # #compute bayesian optimization criteria
+        pred = self.M[discrete_state][target_p](
+                        eval_pt
+                    )
 
-        if self.cfg["model"]["GP_MODEL"]["name"] == "ASGPModel" or self.cfg["model"]["GP_MODEL"]["name"] == "DeepKernel":
+        var_v = pred.variance
+        mean_v = pred.mean
+
+        #Deisenroth criterion
+        is_v_ok = (var_v > 0.0000001)
+        out_vec = is_v_ok*(rho * (mean_v) + beta / 2.0 * torch.log(var_v + 1e-15)) + torch.logical_not(is_v_ok)*pen_val
+
+        return out_vec
+
+    def mean_squared_error_GP(self, eval_pt, discrete_state, target_p):
+
+        try:
             eval_pt = self.M[discrete_state][target_p].feature_extractor(eval_pt)
+        except:
+            pass
 
         #compute the mean squared error MSE according to Dario Azzimonti Gaussian processes and sequential design of experiments (lecture)
         if eval_pt.shape[0] > 1:             
             eval_pt = torch.unsqueeze(eval_pt,1) #doing a batch of points needs to be done as batches of single points
 
         train_inputs = self.M[discrete_state][target_p].train_inputs[0]
-        if self.cfg["model"]["GP_MODEL"]["name"] == "ASGPModel" or self.cfg["model"]["GP_MODEL"]["name"] == "DeepKernel":
+        try:
             train_inputs = self.M[discrete_state][target_p].feature_extractor(train_inputs)
+        except:
+            pass
 
         kxx = self.M[discrete_state][target_p].covar_module(eval_pt).evaluate()
         kXx = self.M[discrete_state][target_p].covar_module(train_inputs,eval_pt).evaluate()
@@ -644,6 +655,22 @@ class SpecifiedModel(DPGPScipyModel):
         out_vec = torch.diagonal(out_vec_)
         if out_vec.ndim == 2:
             out_vec = torch.diag(out_vec)
+
+        return out_vec
+    
+    def bal_utility_func(self, scaled_state,target_p,pen_val=torch.tensor([-1.0e10])):
+        if scaled_state.ndim == 1:
+            discrete_state = int(scaled_state[-1].item())
+            eval_pt = torch.unsqueeze(scaled_state[:-1],0)
+        elif scaled_state.ndim == 2:
+            discrete_state = int(scaled_state[0,-1].item())
+            assert torch.min(scaled_state[:,-1] == scaled_state[0,-1]), f"Something wrong with discrete states {scaled_state}"
+            eval_pt = scaled_state[:,:-1]
+
+        eval_pt = (eval_pt[:,self.get_d_cols(discrete_state)])
+
+        out_vec = self.mean_squared_error_GP(eval_pt,discrete_state,target_p)
+        # out_vec = self.bayesian_opt_criterion(eval_pt,discrete_state,target_p)
 
         # #compute bayesian optimization criteria
         # pred = self.M[discrete_state][target_p](
@@ -685,15 +712,15 @@ class SpecifiedModel(DPGPScipyModel):
 
         return out_vec
 
+
     def BAL(self):
 
         n_types = self.cfg["model"]["params"]["n_types"]
         lower_V = self.cfg["model"]["params"]["lower_V"]
         gp_offset = self.cfg["model"]["params"]["GP_offset"]
         pen_val = -1.0e10
-        target = self.cfg["BAL"]["targets"][0]
         dim_state = self.state_sample_all.shape[1]
-        if (self.epoch // self.cfg["BAL"]["epoch_freq"]) % 20 == 0: #every 20th BAL step we randomly sample instead of simulating
+        if (self.epoch // self.cfg["BAL"]["epoch_freq"]) % 10 == 0: #every 20th BAL step we randomly sample instead of simulating
             if not self.cfg.get("distributed") or dist.get_rank() == 0:
                 n_sample_pts = 2000
                 rand_sample, dummy = self.sample(n_sample_pts)
@@ -708,7 +735,7 @@ class SpecifiedModel(DPGPScipyModel):
                     bal_util = torch.zeros([n_pts])
                     for indxp in range(n_pts):
                         with torch.no_grad():
-                            bal_util[indxp] = self.bal_utility_func(sample_tmp[indxp,:],0,target.get("rho"),target.get("beta"), pen_val=torch.tensor([pen_val]))
+                            bal_util[indxp] = self.bal_utility_func(sample_tmp[indxp,:],0, pen_val=torch.tensor([pen_val]))
                     pts_tmp = torch.zeros([n_pts,1 + dim_state])
                     pts_tmp[:,:-1] = sample_tmp
                     pts_tmp[:,-1] = bal_util
@@ -770,7 +797,7 @@ class SpecifiedModel(DPGPScipyModel):
                     test_pt[:-1] = torch.unsqueeze(torch.from_numpy(point),dim=0)
                     self.cfg["model"]["params"]["max_points"][indxd,:] = test_pt[:-1]
                     test_pt[-1] = indxd
-                    bal_util = self.bal_utility_func(test_pt,0,target.get("rho"),target.get("beta"), pen_val=torch.tensor([pen_val]))
+                    bal_util = self.bal_utility_func(test_pt,0, pen_val=torch.tensor([pen_val]))
                     out_tmp[indxd,-1] = bal_util[0]
                     out_tmp[indxd,:(dim_state-1)] = test_pt[:-1]
                     out_tmp[indxd,-2] = 1.*indxd
@@ -815,7 +842,7 @@ class SpecifiedModel(DPGPScipyModel):
 
                     #compute state transition
                     pol_out = torch.zeros(self.control_dim)
-                    params = self.get_params(current_state[0,:],None)
+                    params = self.get_params(current_state[0,:],torch.zeros([self.combined_sample_all.shape[1]-1]))
                     try:
                         for p1 in range(1,n_types+1):
 
@@ -831,23 +858,23 @@ class SpecifiedModel(DPGPScipyModel):
                     #compare bal utility
                     
                     with torch.no_grad():
-                        bal_util = self.bal_utility_func(current_state,0,target.get("rho"),target.get("beta"), pen_val=torch.tensor([pen_val]))
+                        bal_util = self.bal_utility_func(current_state,0, pen_val=torch.tensor([pen_val]))
                         v = self.M[current_disc_state][0](current_state[:,:-1]).mean
 
                     # if v + gp_offset > 1.1*params[f"V_{current_disc_state}_sample_max"]: #if at any point we exceed the max value of all interpolpts then prioritze them when adding pts
                     #     bal_util += 100. + v + gp_offset
 
-                    #check of we need to abort sim because we walked somewhere nonsensical
-                    # if (v < lower_V - gp_offset and indxt > 0 and self.epoch > n_rand_its):
-                    #     print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
-                    #     break
-                    if v <= 0.0 and indxt > 0: # and self.epoch <= 300:
-                        print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
-                        break
-
                     if bal_util > out_tmp[current_disc_state,-1]:
                         out_tmp[current_disc_state,:-1] = current_state[0,:]
                         out_tmp[current_disc_state,-1] = bal_util[0]
+
+                    #check of we need to abort sim because we walked somewhere nonsensical
+                    if (v < lower_V - gp_offset and indxt > 0 and self.epoch > n_rand_its):
+                        print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
+                        break
+                    if v <= 0.0 and indxt > 0: # and self.epoch <= 300:
+                        print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
+                        break
 
                     cat_dist = torch.distributions.categorical.Categorical(trans_mat[current_disc_state,:])
                     next_disc_state = int((cat_dist.sample()).item())
@@ -887,10 +914,12 @@ class SpecifiedModel(DPGPScipyModel):
                     n_pts += 1
 
             out = torch.zeros([n_pts,dim_state])
+            final_bal_util = torch.zeros([n_pts])
             indxp = 0
             for indxd in range(self.cfg["model"]["params"]["discrete_state_dim"]):
                 if cand_pts[indxd,-1] > pen_val:
                     out[indxp,:] = cand_pts[indxd,:-1]
+                    final_bal_util[indxp] = cand_pts[indxd,-1]
                     indxp+=1
 
             new_sample = out
@@ -911,11 +940,11 @@ class SpecifiedModel(DPGPScipyModel):
             self.combined_sample = torch.cat(
                 (
                         self.prev_combined_sample,
-                        torch.zeros([new_sample.shape[0],1+self.policy_dim]),
+                        -123.0 * torch.ones([new_sample.shape[0],1+self.policy_dim])
                 ),
                 dim=0,
             )
-            logger.info(f"BAL added points {out}")
+            logger.info(f"BAL added points {out} with final bal util {final_bal_util}")
         
         self.warm_start = False
 
@@ -989,7 +1018,7 @@ class SpecifiedModel(DPGPScipyModel):
         self.prev_combined_sample = self.combined_sample_all.clone()
         while indx_it < self.cfg["model"]["params"]["n_Howard_steps"] and error_old > 1e-7 and self.epoch > 100:
 
-            self.fit_GP(training_iter, vf_lst, self.warm_start)
+            # self.fit_GP(training_iter, vf_lst, self.warm_start)
                 
             self.sample_all_Howard()
             self.Howard_step(vf_lst)
@@ -1013,7 +1042,7 @@ class SpecifiedModel(DPGPScipyModel):
             self.prev_combined_sample = self.combined_sample_all.clone()
             error_old = error_new
 
-            # self.fit_GP(0, vf_lst, True) #sync GPs without training using previous parameters
+            self.fit_GP(0, vf_lst, True) #sync GPs without training using previous parameters
 
 
         self.save()
@@ -1146,8 +1175,10 @@ class SpecifiedModel(DPGPScipyModel):
                 if int(A / tasks_per_worker) == dist.get_rank()
             ]
         else:
-            worker_slice = list(range(len(dp)))
-
+            worker_slice = [
+                A
+                for A in range(len(dp))
+            ]
         for w, W in enumerate(dp):
             d, p = W
             # update the training data - last column is the discrete state
@@ -1157,13 +1188,13 @@ class SpecifiedModel(DPGPScipyModel):
                 ),
                 :-1,
             ]
-            train_sample = train_sample_rows[:,self.get_d_cols(d)].clone()
+            train_sample = train_sample_rows[:,self.get_d_cols(d)].clone().contiguous()
             train_v = self.combined_sample_all[
                 self.get_d_rows(
                     d, drop_non_converged=self.cfg.get("drop_non_converged")
                 ),
                 p,
-            ].clone()
+            ].clone().contiguous()
 
             if p > 0:
                 train_vf = self.combined_sample_all[
@@ -1175,19 +1206,8 @@ class SpecifiedModel(DPGPScipyModel):
                 lower_V = self.cfg["model"]["params"]["lower_V"]
                 gp_offset = self.cfg["model"]["params"]["GP_offset"]     
                 mask_feas = train_vf + gp_offset >= lower_V
-                train_v = train_v[mask_feas]
-                train_sample = train_sample[mask_feas,:]
-            # elif self.epoch > 1:
-            #     train_vf = self.combined_sample_all[
-            #         self.get_d_rows(
-            #             d, drop_non_converged=self.cfg.get("drop_non_converged")
-            #         ),
-            #         0,
-            #     ].clone()                
-            #     lower_V = self.cfg["model"]["params"]["lower_V"]
-            #     gp_offset = self.cfg["model"]["params"]["GP_offset"]     
-            #     mask_feas = train_vf + gp_offset >= lower_V
-            #     train_v = mask_feas * train_v
+                train_v = train_v[mask_feas].clone().contiguous()
+                train_sample = train_sample[mask_feas,:].clone().contiguous()
 
             self.M[d][p] = self.create_model(d, p, train_sample, train_v, warm_start)
 
