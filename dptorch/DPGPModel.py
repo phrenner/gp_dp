@@ -31,6 +31,7 @@ class DPGPModel(ABC):
         V_guess=None,
         cfg={},
         metrics = {},
+        epoch: int = 0,
         state_sample=torch.tensor([]),
         V_sample=torch.tensor([]),
         policy_sample=torch.tensor([]),
@@ -39,11 +40,11 @@ class DPGPModel(ABC):
         policy_names=[],
         state_names=[],
     ):
-        self.current_ll = 0
-        self.epoch = 0
+        self.epoch = epoch
         self.discrete_state_dim = discrete_state_dim
         self.state_sample = state_sample
-        self.metrics 
+        self.metrics = metrics
+        self.warm_start = cfg.get("warm_start", False)
 
         if cfg.get("WORKER_MAIN_LOG_LEVEL", False) and rank > 0:
             main_logger.setLevel(cfg["WORKER_MAIN_LOG_LEVEL"])
@@ -51,11 +52,7 @@ class DPGPModel(ABC):
         if cfg.get("WORKER_TRAIN_LOG_LEVEL", False) and rank > 0:
             training_logger.setLevel(cfg["WORKER_TRAIN_LOG_LEVEL"])
 
-        self.device = torch.device(
-            "cuda"
-            if torch.cuda.is_available() and not cfg.get("force_cpu", False)
-            else "cpu"
-        )
+        self.device = torch.device("cpu")
 
         main_logger.info("Received config: ")
         main_logger.info(cfg)
@@ -416,23 +413,18 @@ class DPGPModel(ABC):
             self.M[d][p] = self.create_model(d, p, train_sample, train_v)
             self.optimizer[d][p] = self.create_optimizer(d,p)
 
-
-        if self.cfg.get("init_with_zeros") and self.epoch == 1:
-            training_iter = 0
+        current_ll_ = torch.tensor(0.)
 
         def closure():
             batch_size = self.cfg["torch_optim"].get("minibatch_size")
-            if batch_size:
-                batch_ix = torch.randperm(train_sample.shape[0])[
-                    :batch_size
-                ]
-                self.M[d][p].set_train_data(
-                    train_sample[batch_ix, :],
-                    train_v[batch_ix],
-                    strict=False,
-                )
-            else:
-                batch_ix = range(train_sample.shape[0])
+            batch_ix = torch.randperm(train_sample.shape[0])[
+                :batch_size
+            ]
+            self.M[d][p].set_train_data(
+                train_sample[batch_ix, :],
+                train_v[batch_ix],
+                strict=False,
+            )
 
             # Zero gradients from previous iteration
             self.optimizer[d][p].zero_grad()
@@ -440,11 +432,11 @@ class DPGPModel(ABC):
             output = self.M[d][p](train_sample[batch_ix, :])
             # Calc loss and backprop gradients
 
-            self.current_ll = -self.mll[d][p](output, train_v[batch_ix])
+            current_ll_ = -self.mll[d][p](output, train_v[batch_ix])
+            
+            current_ll_.backward()
 
-            self.current_ll.backward()
-
-            return self.current_ll
+            return current_ll_
 
         rel_ll_change_tol,relative_ll_grad_tol,relative_error_tol,parameter_change_tol = self.get_fit_precision(d,p)
         rel_err = 1e10
@@ -482,7 +474,7 @@ class DPGPModel(ABC):
                             d,
                             p,
                             i-1,
-                            self.current_ll,
+                            current_ll_,
                             current_noise,
                             rel_err,
                             rel_ll_change,
@@ -512,7 +504,7 @@ class DPGPModel(ABC):
                                 d,
                                 p,
                                 i-1,
-                                self.current_ll,
+                                current_ll_,
                                 current_noise,
                                 rel_err,
                                 rel_ll_change,
@@ -530,30 +522,15 @@ class DPGPModel(ABC):
 
             self.M[d][p].train()
             self.likelihood[d][p].train()
-            try:
-                self.optimizer[d][p].step(closure)
-                
-                if torch.isnan(self.current_ll):
-                    raise ValueError(f"found nan in iteration {i} while training state {d} and policy {p} training inputs {train_sample} training targets {train_v}")                        
-            except:
-                self.M[d][p].load_state_dict(state_dict_old)
-                self.optimizer[d][p].load_state_dict(state_dict_opt_old)
-                ll_grad_norm = prior_grad_norm
-                self.M[d][p].eval()
-                self.likelihood[d][p].eval()    
-                with torch.no_grad():
-                    current_ll = self.mll[d][p](self.M[d][p](train_sample), train_v)
-                    rel_err = torch.linalg.norm((((self.M[d][p](train_sample)).mean - train_v)/(1 + torch.abs(train_v))),ord=2)/train_v.shape[0]
-
-                rel_ll_change = abs(current_ll - old_ll)/(1+abs(old_ll))
-                training_logger.info(f"Training step failed in step {i} for state {d} and policy {p} reset to previous step model and optimizer state and stop with interpol error {rel_err} ll error {rel_ll_change} and grad {ll_grad_norm}.")
-
-                break
+            self.optimizer[d][p].step(closure)
+            
+            if torch.isnan(current_ll_):
+                raise ValueError(f"found nan in iteration {i} while training state {d} and policy {p} training inputs {train_sample} training targets {train_v}")                        
 
             max_param_change = max(torch.max((torch.abs(prev_param - param)/(1e-6 + torch.abs(prev_param)))).item() for prev_param, param in zip(prev_params, self.M[d][p].parameters()))
             prev_params = [param.clone() for param in self.M[d][p].parameters()]
 
-            current_ll = self.current_ll
+            current_ll = current_ll_
             rel_ll_change = abs(current_ll - old_ll)/(1+abs(old_ll))
             if (i + 1) % (training_iter / 2) == 0:
                 try:
@@ -566,7 +543,7 @@ class DPGPModel(ABC):
                             d,
                             p,
                             i,
-                            self.current_ll,
+                            current_ll_,
                             current_noise,
                             rel_err,
                             rel_ll_change,
@@ -632,9 +609,9 @@ class DPGPModel(ABC):
                 .to(self.device)
             )
         else:
-            self.combined_sample_all = self.combined_sample.to(self.device)
-            self.non_converged_all = self.non_converged.to(self.device)
-            self.feasible_all = self.feasible.to(self.device)
+            self.combined_sample_all = self.combined_sample.clone().detach().to(self.device)
+            self.non_converged_all = self.non_converged.clone().detach().to(self.device)
+            self.feasible_all = self.feasible.clone().detach().to(self.device)
 
         V_sample_all,policy_sample_all = self.process_training_data(self.state_sample_all,self.combined_sample_all)
         self.V_sample_all = V_sample_all
@@ -856,52 +833,6 @@ class DPGPModel(ABC):
                 err[indxd] = scale * err[indxd]
         return err
 
-    def save(self):
-        import os
-        import re
-
-        save_path = (
-            self.cfg.get("cwd", os.getcwd()) + "/Iter_" + str(self.epoch) + ".pth"
-        )
-        """ Saves the current state of the model """
-
-        if not self.cfg.get("distributed") or dist.get_rank() == 0:
-            torch.save(
-                {
-                    "epoch": self.epoch,
-                    "discrete_state_dim": self.discrete_state_dim,
-                    "policy_dim": self.policy_dim,
-                    "model_state_dict": {
-                        f"{d},{p}": self.M[d][p].state_dict()
-                        for d in range(self.discrete_state_dim)
-                        for p in range(1 + self.policy_dim)
-                    },
-                    "optimizer_state_dict": {
-                        f"{d},{p}": self.optimizer[d][p].state_dict()
-                        for d in range(self.discrete_state_dim)
-                        for p in range(1 + self.policy_dim)
-                    },
-                    "loss": self.current_ll,
-                    "cfg": self.cfg,
-                    "state_sample_all": self.state_sample_all,
-                    "non_converged_all": self.non_converged_all,
-                    "feasible_all": self.feasible_all,
-                    "combined_sample_all": self.combined_sample_all,
-                    "rng_state": torch.get_rng_state(),
-                },
-                save_path,
-            )
-
-            m = re.match(
-                r".*/runs/(?P<model>.*?)/(?P<run_day>.*?)/(?P<run_time>.*?)/(?P<checkpoint_name>.*)",
-                save_path,
-            )
-
-            main_logger.info(f"Saving current state to {save_path}")
-            main_logger.info(
-                f"Post-process command:\n python post_process.py RUN_DIR={save_path}"
-            )
-
     def bal_utility_func(self,eval_pt,discrete_state,target_p,rho,beta):
         eval_pt = (eval_pt[:,self.get_d_cols(discrete_state)])
         pred = self.M[discrete_state][target_p](
@@ -977,6 +908,52 @@ class DPGPModel(ABC):
                 dim=0,
             )
 
+    def save(self):
+        import os
+        import re
+
+        save_path = (
+            self.cfg.get("cwd", os.getcwd()) + "/Iter_" + str(self.epoch) + ".pth"
+        )
+        """ Saves the current state of the model """
+
+        if not self.cfg.get("distributed") or dist.get_rank() == 0:
+            torch.save(
+                {
+                    "epoch": self.epoch,
+                    "discrete_state_dim": self.discrete_state_dim,
+                    "policy_dim": self.policy_dim,
+                    "model_state_dict": {
+                        f"{d},{p}": self.M[d][p].state_dict()
+                        for d in range(self.discrete_state_dim)
+                        for p in range(1 + self.policy_dim)
+                    },
+                    "optimizer_state_dict": {
+                        f"{d},{p}": self.optimizer[d][p].state_dict()
+                        for d in range(self.discrete_state_dim)
+                        for p in range(1 + self.policy_dim)
+                    },
+                    "cfg": self.cfg,
+                    "state_sample_all": self.state_sample_all,
+                    "non_converged_all": self.non_converged_all,
+                    "feasible_all": self.feasible_all,
+                    "combined_sample_all": self.combined_sample_all,
+                    "rng_state": torch.get_rng_state(),
+                    "metrics": self.metrics,
+                },
+                save_path,
+            )
+
+            m = re.match(
+                r".*/runs/(?P<model>.*?)/(?P<run_day>.*?)/(?P<run_time>.*?)/(?P<checkpoint_name>.*)",
+                save_path,
+            )
+
+            main_logger.info(f"Saving current state to {save_path}")
+            main_logger.info(
+                f"Post-process command:\n python post_process.py RUN_DIR={save_path}"
+            )
+
     @classmethod
     def load(cls, path, cfg_override, **kwargs):
         checkpoint = torch.load(path)
@@ -987,6 +964,8 @@ class DPGPModel(ABC):
             state_sample=checkpoint["state_sample_all"],
             V_sample=checkpoint["combined_sample_all"][:, 0],
             policy_sample=checkpoint["combined_sample_all"][:, 1:],
+            metrics=checkpoint.get("metrics", {}),
+            epoch=checkpoint["epoch"],
             **kwargs
         )
         dpgp.combined_sample_all=checkpoint["combined_sample_all"]
@@ -994,12 +973,11 @@ class DPGPModel(ABC):
         dpgp.non_converged_all = checkpoint["non_converged_all"]
         dpgp.feasible_all = checkpoint["feasible_all"]
         # dpgp.feasible_all[:] = 1.0
-        dpgp.current_ll = checkpoint["loss"]
         dpgp.epoch = checkpoint["epoch"]
         def get_d_rows(d, drop_non_converged=True):
             d_selected = dpgp.state_sample_all[:, -1] == d
             if drop_non_converged:
-                return torch.logical_and(d_selected, dpgp.state_sample_all < 1)
+                return torch.logical_and(d_selected, dpgp.non_converged_all < 1)
             else:
                 return d_selected
             
