@@ -1,4 +1,7 @@
 # Dynamic programming with GPyTorch and MPI
+Authors:
+- Philipp Renner, Lancaster University
+- Simon Scheidegger, HEC Lausanne
 
 Dependencies:
 
