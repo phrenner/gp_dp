@@ -3,13 +3,15 @@ import torch
 
 def dynamic_params(cfg):
 
+    cfg["no_samples"] = 32
     cfg["warm_start"] = False #warm start for gp fitting
     cfg["use_fixed_noise"] = True #use fixed noise for likelyhood
     cfg["drop_non_converged"] = True #drop non converged points from the training set
+    cfg["CHECKPOINT_INTERVAL"] = 1
 
     cfg["BAL"] = {"enabled" : True}
     cfg["BAL"]["epoch_freq"] = 30
-    cfg["BAL"]["max_points"] = 10000
+    cfg["BAL"]["max_points"] = 100000
 
     cfg["torch_optim"] = {}
     cfg["torch_optim"]["LR"] = 1e-3
@@ -25,11 +27,11 @@ def dynamic_params(cfg):
     cfg["torch_optim"]["relative_error_tol_pol"] = 0
     cfg["torch_optim"]["parameter_change_tol_pol"] = 1e-3
 
-    cfg["scipyopt"]["maxiter"] = 400
-    cfg["scipyopt"]["no_restarts"] = 3
+    cfg["scipyopt"] = {"maxiter": 400}
+    cfg["scipyopt"]["no_restarts"] = 2
     cfg["scipyopt"]["method"] = "SLSQP"
     cfg["scipyopt"]["tol"] = 1e-6
-    
+
     ### Define constants
     cfg["model"] = {"params":{}}
     cfg["model"]["params"]["n_types"] = 2
@@ -54,21 +56,16 @@ def dynamic_params(cfg):
     cfg["model"]["params"]["shock_vec"] = shoch_vec
     beta = cfg["model"]["params"]["beta"]
 
-    upper_shock_length = cfg["model"]["params"]["upper_shock_length"]
-    lower_shock_length = cfg["model"]["params"]["lower_shock_length"]
-    trans_mat = torch.tensor([[1 - 1/lower_shock_length, 1/lower_shock_length],[1/upper_shock_length, 1 - 1/upper_shock_length]])
-    cfg["model"]["params"]["stationary_distribution"] = torch.tensor(
-        [(1/upper_shock_length)/(1/upper_shock_length + 1/lower_shock_length),(1/lower_shock_length)/(1/upper_shock_length + 1/lower_shock_length)])
-    cfg["model"]["params"]["expected_shock"] = torch.sum(cfg["model"]["params"]["stationary_distribution"]*shoch_vec)
-    L,V = torch.linalg.eig(trans_mat)
+    trans_mat = torch.zeros([n_types,n_types])
+    upper_triangular_mat = 0.1*torch.cat([torch.cat([torch.zeros([n_types-1,1]),torch.eye(n_types-1)],1),torch.zeros([1,n_types])],0)
+    trans_mat += upper_triangular_mat #upper diagonal set to 0.1
+    trans_mat += torch.transpose(upper_triangular_mat,0,1) #lower diagonal set to 0.1
+    tmp_mat = 0.8*torch.eye(n_types)
+    tmp_mat[0,0] = 0.9
+    tmp_mat[-1,-1] = 0.9
+    trans_mat = trans_mat + tmp_mat #set diagonal to 0.8 except for the corner pts
     reg_c = cfg["model"]["params"]["reg_c"]
     sigma = cfg["model"]["params"]["sigma"]
-    long_run = torch.unsqueeze(1/(1 - beta * L.real),-1)
-    right_side = torch.matmul(torch.linalg.inv(V.real),torch.unsqueeze(model.utility_ind(shoch_vec, reg_c, sigma),-1))
-    reseveration_util_vec = torch.ones(n_types)
-    for indxt in range(n_types):
-        reseveration_util_vec[indxt] = torch.matmul((V.real)[indxt:indxt+1,:],right_side*long_run)[0]
-    cfg["model"]["params"]["reseveration_util_vec"] = (reseveration_util_vec)
     cfg["model"]["params"]["trans_mat"] = trans_mat
     cfg["model"]["params"]["trans_mat_inv"] = torch.inverse(cfg["model"]["params"]["trans_mat"])
     upper_trans = cfg["model"]["params"]["upper_trans"]
