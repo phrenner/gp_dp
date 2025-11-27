@@ -25,7 +25,7 @@ def set_conf(cfg):
     )
     logger.info("Original configuration:")
     logger.info(OmegaConf.to_yaml(cfg_run))
-    model = importlib.import_module(cfg_run.model.MODEL_NAME + ".Model")
+    model = importlib.import_module(cfg_run.MODEL_NAME + ".Model")
 
     # RNG
     torch.manual_seed(0)
@@ -71,6 +71,7 @@ def set_conf(cfg):
     logger.info(f"Loading checkpoint file: {CHECKPOINT_FILE}")
 
     checkpoint_indx = int((CHECKPOINT_FILE.split("Iter_")[-1]).split(".")[0])
+    checkpoint_indx_start = int((CHECKPOINT_FILE.split("Iter_")[0]).split(".")[0])
 
     # load the specified model
     m = model.SpecifiedModel.load(
@@ -90,13 +91,13 @@ def set_conf(cfg):
     logging.getLogger("DPGPModel").setLevel(30)
 
     # call the post_processing script for the model
-    pp = importlib.import_module(cfg_run.model.MODEL_NAME + ".PostProcess")
+    pp = importlib.import_module(cfg_run.MODEL_NAME + ".PostProcess")
 
     #pp.logger.setLevel(logging.WARNING)
 
-    pp.process(m, cfg)
+    pp.process(m, cfg, checkpoint_indx_start, checkpoint_indx)
     
-    err_out = open(f"V_func_error.txt", 'w')
+    err_out = open(f"V_func_error_{checkpoint_indx_start}_{checkpoint_indx}.txt", 'w')
     err_out.write("#T1 T2 L2 LInf \n")   
     err_out.close()    
     # iterate over checkpoints

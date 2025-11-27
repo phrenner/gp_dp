@@ -19,21 +19,13 @@ class CustomMean(Mean):
 class GPModel(gpytorch.models.ExactGP):
     def __init__(self, d,p, train_x, train_y, likelihood, cfg, batch_shape=torch.Size([])):
         super(GPModel, self).__init__(train_x, train_y, likelihood)
-        # self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
-        # self.mean_module = gpytorch.means.LinearMean(input_size=train_x.shape[-1], batch_shape=batch_shape)
-        self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape)
-        # gp_offset = cfg["model"]["params"]["GP_offset"]
-        # expected_shock = cfg["model"]["params"]["expected_shock"]
-        # mean_fix = -gp_offset + expected_shock
-        # max_val = torch.max(train_y)
-        # mean_fix = -gp_offset + max_val
-        # self.mean_module = CustomMean(value=mean_fix,batch_shape=batch_shape)
+        self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
         self.covar_module = gpytorch.kernels.ScaleKernel(
             gpytorch.kernels.PiecewisePolynomialKernel(
                 q = 0,
                 ard_num_dims = train_x.shape[-1],
                 eps = 1e-7,
-            )) + gpytorch.kernels.ConstantKernel()
+            ))
         self.batch_shape = batch_shape
         self.mean = torch.mean(train_x, 0)
         self.var = torch.var(train_x, 0)

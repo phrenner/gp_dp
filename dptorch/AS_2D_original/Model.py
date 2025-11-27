@@ -722,30 +722,41 @@ class SpecifiedModel(DPGPScipyModel):
         dim_state = self.state_sample_all.shape[1]
         if (self.epoch // self.cfg["BAL"]["epoch_freq"]) % 10 == 0: #every 20th BAL step we randomly sample instead of simulating
             if not self.cfg.get("distributed") or dist.get_rank() == 0:
-                n_sample_pts = 2000
-                rand_sample, dummy = self.sample(n_sample_pts)
-                cand_pts_gather = torch.zeros([0,1 + dim_state])
-                for indxt in range(n_types):
-                    mask_type = rand_sample[:,-1] == 1.*indxt
-                    with torch.no_grad():
-                        V_val_vec = self.M[indxt][0](rand_sample[mask_type,:-1]).mean
-                    mask_feas = V_val_vec > lower_V - 0.1 - gp_offset
-                    sample_tmp = rand_sample[mask_type,:][mask_feas,:]
-                    n_pts = sample_tmp.shape[0]
-                    bal_util = torch.zeros([n_pts])
-                    for indxp in range(n_pts):
+                new_sample = torch.empty((0,self.state_sample_all.shape[1]+1))
+                mask_feas = self.combined_sample_all[:,0] + gp_offset > lower_V
+                state_sample_feas = self.state_sample_all[mask_feas,:]
+                for indxp in range(state_sample_feas.shape[0]):
+                    # calculate BAL utility for each of the new sample
+                    non_empty_vec = True
+
+                    weighs, next_points = self.state_iterate_exp(state_sample_feas[indxp,:],{},self.combined_sample_all[indxp,1:])
+                    bal_utility = -1.0e10*torch.ones(next_points.shape[0])
+                    for indx_eval in range(next_points.shape[0]):
+                        eval_pt = next_points[indx_eval,:]
                         with torch.no_grad():
-                            bal_util[indxp] = self.bal_utility_func(sample_tmp[indxp,:],0, pen_val=torch.tensor([pen_val]))
-                    pts_tmp = torch.zeros([n_pts,1 + dim_state])
-                    pts_tmp[:,:-1] = sample_tmp
-                    pts_tmp[:,-1] = bal_util
+                            bal_utility[indx_eval] = self.bal_utility_func(eval_pt,0)
+
+                    new_sample = torch.cat(
+                                (
+                                    next_points,
+                                    torch.unsqueeze(bal_utility,dim=1)
+                                )
+                                ,1
+                            )        
+
+                cand_pts_gather = torch.zeros([0,1 + dim_state])
+                for indx_t in range(n_types):
+                    mask = new_sample[:,-2] == 1.*indx_t
+                    bal_utility = new_sample[mask,-1]
+                    max_indx = torch.argsort(bal_utility, descending=True)[ : 1]
+
                     cand_pts_gather = torch.cat(
                         (
                             cand_pts_gather,
-                            pts_tmp
+                            new_sample[mask][max_indx,:]
                         ),
-                        dim=0
-                    )
+                        dim=0,
+                    )                
 
         else: # if we do not sample randomly we simulate
 
@@ -864,10 +875,6 @@ class SpecifiedModel(DPGPScipyModel):
                     # if v + gp_offset > 1.1*params[f"V_{current_disc_state}_sample_max"]: #if at any point we exceed the max value of all interpolpts then prioritze them when adding pts
                     #     bal_util += 100. + v + gp_offset
 
-                    if bal_util > out_tmp[current_disc_state,-1]:
-                        out_tmp[current_disc_state,:-1] = current_state[0,:]
-                        out_tmp[current_disc_state,-1] = bal_util[0]
-
                     #check of we need to abort sim because we walked somewhere nonsensical
                     if (v < lower_V - gp_offset and indxt > 0 and self.epoch > n_rand_its):
                         print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
@@ -875,6 +882,9 @@ class SpecifiedModel(DPGPScipyModel):
                     if v <= 0.0 and indxt > 0: # and self.epoch <= 300:
                         print(f"Break simulation in iteration {indxt} with value {v + gp_offset} at point {current_state[0,:]}")
                         break
+                    if bal_util > out_tmp[current_disc_state,-1]:
+                        out_tmp[current_disc_state,:-1] = current_state[0,:]
+                        out_tmp[current_disc_state,-1] = bal_util[0]
 
                     cat_dist = torch.distributions.categorical.Categorical(trans_mat[current_disc_state,:])
                     next_disc_state = int((cat_dist.sample()).item())
@@ -922,6 +932,7 @@ class SpecifiedModel(DPGPScipyModel):
                     final_bal_util[indxp] = cand_pts[indxd,-1]
                     indxp+=1
 
+
             new_sample = out
             self.state_sample = torch.cat(
                 (
@@ -940,15 +951,13 @@ class SpecifiedModel(DPGPScipyModel):
             self.combined_sample = torch.cat(
                 (
                         self.prev_combined_sample,
-                        -123.0 * torch.ones([new_sample.shape[0],1+self.policy_dim])
+                        -123.0 * torch.ones([new_sample.shape[0],1+self.policy_dim])                
                 ),
                 dim=0,
             )
             logger.info(f"BAL added points {out} with final bal util {final_bal_util}")
         
         self.warm_start = False
-
-
     def only_fit_trans_pol(self):
         n_types = self.cfg["model"]["params"]["n_types"]
         return  [

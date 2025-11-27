@@ -21,7 +21,7 @@ def grad_V(m,d,state):
     dummy_out.backward()
     return inputs.grad
 
-def process(m, cfg):
+def process(m, cfg, checkpoint_indx_start, checkpoint_indx):
 
     lower_V = m.cfg["model"]["params"]["lower_V"]
     gp_offset = m.cfg["model"]["params"]["GP_offset"]
@@ -29,7 +29,7 @@ def process(m, cfg):
     beta = m.cfg["model"]["params"]["beta"]
 
     # deleting the error file
-    f = open("V_func_error.txt", 'w')
+    f = open(f"V_func_error_{checkpoint_indx_start}_{checkpoint_indx}.txt", 'w')
     n_plot_pts = 50000
 
     plot_sample,dummy = m.sample(n_plot_pts)
