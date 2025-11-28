@@ -243,6 +243,7 @@ class SpecifiedModel(DPGPScipyModel):
         return fit_lst
 
     def sample(self,no_samples_=None):
+        torch.manual_seed(self.cfg["seed"] + 55*self.epoch)
         beta = self.cfg["model"]["params"]["beta"]
         n_types = self.cfg["model"]["params"]["n_types"]
         if no_samples_ is None:
@@ -339,6 +340,7 @@ class SpecifiedModel(DPGPScipyModel):
 
     @torch.no_grad()
     def sample_start_pts(self, scaled_state, params, policy, n_restarts):
+        torch.manual_seed(self.cfg["seed"] + 33*self.epoch)
         state = self.unscale_state(scaled_state)
         S = self.S
         P = self.P
@@ -672,44 +674,6 @@ class SpecifiedModel(DPGPScipyModel):
         out_vec = self.mean_squared_error_GP(eval_pt,discrete_state,target_p)
         # out_vec = self.bayesian_opt_criterion(eval_pt,discrete_state,target_p)
 
-        # #compute bayesian optimization criteria
-        # pred = self.M[discrete_state][target_p](
-        #                 eval_pt
-        #             )
-
-        # var_v = pred.variance
-        # mean_v = pred.mean
-
-        # #Deisenroth criterion
-        # is_v_ok = (var_v > 0.0000001)
-        # out_vec = is_v_ok*(rho * (mean_v) + beta / 2.0 * torch.log(var_v + 1e-15)) + torch.logical_not(is_v_ok)*pen_val
-
-        # #upper bound criterion
-        # out_vec = (mean_v) + 2 * var_v
-
-        # # #expected improvement criterion
-        # tn = torch.max(
-        #     self.combined_sample_all[
-        #     self.get_d_rows(discrete_state,drop_non_converged=True),
-        #     0])
-        # un = mean_v - tn
-        # mask_var = var_v < 1e-6
-        # out_vec_1 = torch.maximum(
-        #     torch.tensor(0.),
-        #     un)   
-        
-        # m = torch.distributions.normal.Normal(torch.tensor([0.0]), torch.tensor([1.0]))   
-        # var_v_aux = mask_var*torch.ones_like(var_v) + torch.logical_not(mask_var)*var_v
-        # out_vec_2 = (
-        #     torch.maximum(
-        #         torch.tensor(0.),
-        #         un) - 
-        #     torch.abs(un)*m.cdf(un/var_v_aux) + 
-        #     var_v_aux * m.log_prob(un/var_v_aux).exp()) 
-
-        # out_vec = mask_var*out_vec_1 + torch.logical_not(mask_var)*out_vec_2
-
-
         return out_vec
 
 
@@ -720,6 +684,7 @@ class SpecifiedModel(DPGPScipyModel):
         gp_offset = self.cfg["model"]["params"]["GP_offset"]
         pen_val = -1.0e10
         dim_state = self.state_sample_all.shape[1]
+        torch.manual_seed(self.cfg["seed"] + 77*self.epoch)
         if (self.epoch // self.cfg["BAL"]["epoch_freq"]) % 10 == 0: #every 20th BAL step we randomly sample instead of simulating
             if not self.cfg.get("distributed") or dist.get_rank() == 0:
                 new_sample = torch.empty((0,self.state_sample_all.shape[1]+1))
@@ -958,6 +923,7 @@ class SpecifiedModel(DPGPScipyModel):
             logger.info(f"BAL added points {out} with final bal util {final_bal_util}")
         
         self.warm_start = False
+
     def only_fit_trans_pol(self):
         n_types = self.cfg["model"]["params"]["n_types"]
         return  [
@@ -1135,14 +1101,24 @@ class SpecifiedModel(DPGPScipyModel):
 
         import importlib
         gp_model = importlib.import_module(self.cfg["MODEL_NAME"] + ".GPModel")
-        model = gp_model.GPModel(
-                        d,
-                        p,
-                        train_x,
-                        train_y,
-                        self.likelihood[d][p],
-                        self.cfg,
-                    ).to(self.device)
+        if p == 0:
+            model = gp_model.GPModel(
+                            d,
+                            p,
+                            train_x,
+                            train_y,
+                            self.likelihood[d][p],
+                            self.cfg,
+                        ).to(self.device)
+        else:
+            model = gp_model.GPModel_pol(
+                            d,
+                            p,
+                            train_x,
+                            train_y,
+                            self.likelihood[d][p],
+                            self.cfg,
+                        ).to(self.device)
 
         self.mll[d][p] = gpytorch.mlls.ExactMarginalLogLikelihood(
                     self.likelihood[d][p], model

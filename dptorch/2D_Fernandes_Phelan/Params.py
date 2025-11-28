@@ -14,7 +14,7 @@ def dynamic_params(cfg):
     cfg["BAL"]["max_points"] = 100000
 
     cfg["torch_optim"] = {}
-    cfg["torch_optim"]["LR"] = 1e-3
+    cfg["torch_optim"]["LR"] = 1e-2
     cfg["torch_optim"]["iter_per_cycle"] = 10000
 
     cfg["torch_optim"]["relative_ll_change_tol_vf"] = 0
@@ -44,7 +44,7 @@ def dynamic_params(cfg):
     cfg["model"]["params"]["reg_c"] = 0.0001
     cfg["model"]["params"]["pen_opt_vf"] = 50.
     cfg["model"]["params"]["pen_vf"] = 10.0
-    cfg["model"]["params"]["n_Howard_steps"] = 0   
+    cfg["model"]["params"]["n_Howard_steps"] = 20   
 
     model = importlib.import_module(
             cfg["MODEL_NAME"] + ".Model"

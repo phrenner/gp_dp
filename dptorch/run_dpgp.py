@@ -8,6 +8,7 @@ import logging
 import importlib
 import pathlib
 from hydra.utils import get_original_cwd
+import numpy as np
 
 #import traceback
 #import warnings
@@ -61,6 +62,7 @@ def set_conf(cfg):
     # RNG
     cfg["mc_seed"] = cfg["seed"] + int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))
     torch.manual_seed(cfg["mc_seed"])
+    np.random.seed(cfg["mc_seed"] + seed_offset)
 
     model = importlib.import_module(cfg["MODEL_NAME"] + ".Model")
 
