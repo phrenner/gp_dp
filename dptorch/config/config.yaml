@@ -1,0 +1,14 @@
+hydra: 
+  run:
+    dir: runs/${MODEL_NAME}/model  #${now:%Y-%m-%d}/${now:%H-%M-%S}
+  verbose: false
+# can be NEW, LATEST, or a given checkpoint filename
+MODEL_NAME: 2D_Fernandes_Phelan
+STARTING_POINT: NEW
+# ENABLE_BAL: false
+# ENABLE_HOWARD: false
+CHECKPOINT_INTERVAL: 1
+WORKER_MAIN_LOG_LEVEL: ERROR
+WORKER_TRAIN_LOG_LEVEL: INFO
+num_iterations: 10000
+seed: 0  

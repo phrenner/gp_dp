@@ -1,0 +1,5 @@
+python post_process.py ++MODEL_NAME=2D_limited_overreporting RUN_DIR=2D_limited_overreporting/restart ++CHECKPOINT_FILE=Iter_4389.pth
+python post_process.py ++MODEL_NAME=2D_baseline_to_limited_or RUN_DIR=2D_baseline_to_limited_or/restart ++CHECKPOINT_FILE=Iter_5949.pth
+python post_process.py ++MODEL_NAME=4D_limited_overreporting RUN_DIR=4D_limited_overreporting/restart ++CHECKPOINT_FILE=Iter_3009.pth
+python post_process.py ++MODEL_NAME=4D_baseline_to_limited_or RUN_DIR=4D_baseline_to_limited_or/restart ++CHECKPOINT_FILE=Iter_3787.pth
+python post_process.py ++MODEL_NAME=10D_Fernandes_Phelan RUN_DIR=10D_Fernandes_Phelan/restart ++CHECKPOINT_FILE=Iter_4329.pth

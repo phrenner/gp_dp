@@ -1,0 +1,5 @@
+hydra: 
+  run:
+    dir: postprocess/${RUN_DIR}
+RUN_DIR: dummy_run_dir
+CHECKPOINT_FILE: LATEST
